@@ -117,6 +117,45 @@ cd hqba/backend && composer install && cp .env.example .env && php artisan migra
 cd hqba/frontend && npm install && npm run dev
 ```
 
+> ### ⚠️ HQBA ships with insecure bootstrap credentials — change them
+>
+> `hqba/backend/database/migrations/2026_04_28_140000_seed_admin_user.php` creates a
+> `super_admin` account during migration with a **well-known default password and a
+> `000000` PIN**. It runs automatically as part of `php artisan migrate`.
+>
+> This is fine for a throwaway local database and unacceptable anywhere reachable. After
+> the first migration on any shared or deployed environment, change that account's
+> password and PIN immediately — or delete the account and create your own.
+>
+> The defaults are left in the source because they are how the project bootstraps, not
+> because they are safe.
+
+---
+
+## Running migrations safely
+
+The database commands in this README create and modify tables. Point them at a database
+you are willing to lose.
+
+- Use a **local or disposable development database**, configured explicitly in your own
+  `.env`. Never aim a migration, a seed or a test run at a production database.
+- The ERP refuses to seed unless `ERP_SEED_ENABLED=true` is set, and its seed and test
+  harness additionally refuse specific database hosts **by name**. Those host names appear
+  in `erp/prisma/seed.ts` and in the regression self-test: they are hostnames, never
+  credentials, and they are listed there so the guard can refuse them. Removing them to
+  tidy the source would switch the protection off.
+
+---
+
+## Ownership and authorship
+
+This repository is published by its owner. `hqba/` is an included project owned by the
+repository owner; it was originally developed by others, and original commit authorship
+and any third-party copyright and licence notices are preserved as they were found.
+Third-party dependency metadata under `hqba/backend/composer.lock` and the various
+`package-lock.json` files carries upstream package authors' details, which are already
+public in their respective registries.
+
 ---
 
 ## What is deliberately not here
