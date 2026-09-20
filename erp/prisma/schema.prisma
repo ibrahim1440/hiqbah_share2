@@ -1,0 +1,1352 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Employee {
+  id                String         @id @default(cuid())
+  name              String
+  username          String?        @unique
+  /// Secure Version B: bcrypt(pinVerifierInput(pin)), where pinVerifierInput is
+  /// base64(HMAC-SHA384(PIN_LOOKUP_SECRET, "pin:verify:v1:" + pin)). bcrypt is over the keyed
+  /// derivation, never the raw PIN, so a stolen row cannot be brute-forced offline without the
+  /// application secret and the raw PIN never verifies directly.
+  pin               String
+  /// HMAC-SHA256(PIN_LOOKUP_SECRET, "pin:lookup:v1:" + pin), base64. The login selector:
+  /// unforgeable and unsearchable without the application secret, so a database copy no longer
+  /// yields working PINs. Selector only — bcrypt on `pin` remains the proof. Nullable until
+  /// every PIN has been reissued.
+  pinLookup         String?        @unique
+  password          String?
+  role              String // admin, inventory, roasting, qc, dispatch, custom
+  permissions       String         @default("{}")
+  defaultRoute      String         @default("/dashboard")
+  active            Boolean        @default(true)
+  phoneNumber       String?
+  preferredLanguage String         @default("ar") // "ar" | "en"
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  qcRecords         QcRecord[]
+  cuppingScores     CuppingScore[]
+  ownedOrders       Order[]        @relation("OrderOwner") // Order Operations S0 (additive)
+}
+
+model Customer {
+  id               String                    @id @default(cuid())
+  name             String
+  nameAr           String?
+  phone            String?
+  email            String?
+  address          String?
+  createdAt        DateTime                  @default(now())
+  updatedAt        DateTime                  @updatedAt
+  orders           Order[]
+  roastPreferences CustomerRoastPreference[]
+}
+
+model GreenBean {
+  id               String                    @id @default(cuid())
+  serialNumber     String                    @unique
+  beanType         String
+  beanTypeAr       String?
+  country          String
+  countryAr        String?
+  region           String?
+  regionAr         String?
+  variety          String?
+  process          String?
+  processAr        String?
+  altitude         String?
+  location         String?
+  quantityKg       Float                     @default(0)
+  isActive         Boolean                   @default(true)
+  receivedDate     DateTime                  @default(now())
+  createdAt        DateTime                  @default(now())
+  updatedAt        DateTime                  @updatedAt
+  orderItems       OrderItem[]
+  roastingBatches  RoastingBatch[]
+  cuppingSessions  CuppingSession[]
+  roastPreferences CustomerRoastPreference[]
+  coffeeProducts   CoffeeProduct[]
+  productionOrders ProductionOrder[]
+
+  @@index([isActive])
+  @@index([isActive, quantityKg])
+}
+
+model Order {
+  id                String      @id @default(cuid())
+  orderNumber       Int         @unique
+  customerId        String
+  customer          Customer    @relation(fields: [customerId], references: [id])
+  quotationNumber   String?
+  quotationSentDate DateTime?
+  approvalStatus    String      @default("Pending") // Pending, Yes, No
+  approvalDate      DateTime?
+  paymentStatus     String      @default("Not Paid") // Paid, Not Paid, Partial Paid
+  vatInvoiceStatus  String      @default("Not Yet") // Sent, Not Yet, Not Paid
+  notes             String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  items             OrderItem[]
+
+  // ─── Order Operations S0 (additive) ──────────────────────────────────────
+  // Backend-controlled lifecycle status — independent of approvalStatus above,
+  // never accepted through the generic create/update payloads. String (not enum)
+  // to match the existing convention on this model (approvalStatus/paymentStatus/
+  // vatInvoiceStatus are also plain strings, not Prisma enums).
+  // Values: Waiting Approval, Waiting Preparation Review, Preparing,
+  // Ready for Shipping, Completed, On Hold, Cancelled, Rejected
+  status  String    @default("Waiting Approval")
+  ownerId String?
+  owner   Employee? @relation("OrderOwner", fields: [ownerId], references: [id])
+
+  activities OrderActivity[]
+
+  @@index([createdAt])
+  @@index([customerId, createdAt])
+  @@index([status])
+  @@index([ownerId])
+}
+
+model OrderItem {
+  id               String            @id @default(cuid())
+  orderId          String
+  order            Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  greenBeanId      String?
+  greenBean        GreenBean?        @relation(fields: [greenBeanId], references: [id])
+  productId        String?
+  product          CoffeeProduct?    @relation(fields: [productId], references: [id])
+  productSkuId     String?
+  productSku       ProductSKU?       @relation(fields: [productSkuId], references: [id])
+  beanTypeName     String
+  quantityKg       Float
+  productionStatus String            @default("Pending") // Pending, In Production, Completed, Order cancelled
+  deliveryStatus   String            @default("Not Yet") // Not Yet, Partial Delivered, Delivered
+  deliveredQty     Float             @default(0)
+  remainingQty     Float             @default(0)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  roastingBatches  RoastingBatch[]
+  deliveries       Delivery[]
+  productionOrders ProductionOrder[]
+
+  // ─── Order Operations S0 (additive) ──────────────────────────────────────
+  // Written only by POST /api/orders/[id]/preparation-review — never by the
+  // generic order edit route. Float to match quantityKg/deliveredQty/remainingQty
+  // above — this model has no Decimal fields to stay consistent with.
+  // Since the shelf-allocation change these three are SERVER-DERIVED, never client
+  // supplied: availableQuantity is the sum of RESERVED StockAllocation rows for this
+  // item and productionRequiredQuantity is the outstanding remainder.
+  preparationDecision        String? // Available on Shelf, Needs Production, Partially Available, Blocked
+  availableQuantity          Float?
+  productionRequiredQuantity Float?
+
+  allocations StockAllocation[]
+
+  // ─── SKU-based sales lines ───────────────────────────────────────────────
+  // A line created through the Finished Products flow sells whole units of one SKU:
+  // `productSkuId` is set and `quantityUnits` is authoritative. `quantityKg` is still
+  // written, derived as units x (weightGrams / 1000), because delivery, production and
+  // every report downstream read it — it is a projection of units, not a rival total.
+  //
+  // Legacy lines (26 of the 35 that existed at the time of this change) have
+  // quantityUnits = null and only quantityKg. They stay readable and deliverable but
+  // no new line may be created that way: order creation now requires a valid SKU.
+  quantityUnits  Int?
+  deliveredUnits Int  @default(0)
+
+  @@index([productionStatus])
+  @@index([deliveryStatus])
+  @@index([productionStatus, deliveryStatus])
+  @@index([productSkuId])
+}
+
+model RoastingBatch {
+  id String @id @default(cuid())
+
+  // Optional since roast-to-stock. A batch with no order item is a deliberate
+  // replenishment of the shelf: it consumes green stock and writes the same ledger
+  // entries as any other roast, but its packaged output is reserved to nobody and
+  // becomes free-to-promise for whichever order needs it first. Every batch created
+  // before this change carries an order item, and the order-driven path still sets one.
+  orderItemId         String?
+  orderItem           OrderItem?     @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  batchNumber         String
+  date                DateTime       @default(now())
+  greenBeanId         String?
+  greenBean           GreenBean?     @relation(fields: [greenBeanId], references: [id])
+  productId           String?
+  product             CoffeeProduct? @relation(fields: [productId], references: [id])
+  greenBeanQuantity   Float
+  roastedBeanQuantity Float          @default(0)
+  wasteQuantity       Float          @default(0)
+  roastProfile        String?
+  status              String         @default("Pending QC")
+
+  // Packaging (filled post-QC)
+  bags3kg      Int   @default(0)
+  bags1kg      Int   @default(0)
+  bags250g     Int   @default(0)
+  bags150g     Int   @default(0)
+  samplesGrams Float @default(0)
+
+  // ─── Roasted / intermediate stock ────────────────────────────────────────
+  // Roasted coffee from this batch that has not yet been packed into a finished SKU.
+  // This is the intermediate stage the finished-goods BOM draws on: roasting raises it,
+  // packaging lowers it. Green coffee is consumed by roasting alone and never by a BOM.
+  //
+  // Seeded from roastedBeanQuantity minus what this batch had already packed at
+  // migration time, so existing batches do not suddenly present already-packed coffee
+  // as available. A CHECK constraint keeps it within [0, roastedBeanQuantity].
+  roastedAvailableKg Float @default(0)
+
+  // Blending lineage
+  isBlend       Boolean         @default(false) // true = this is a blend output, NOT new production
+  blendTiming   String?
+  parentBatchId String?
+  parentBatch   RoastingBatch?  @relation("BlendLineage", fields: [parentBatchId], references: [id])
+  childBatches  RoastingBatch[] @relation("BlendLineage")
+
+  // Multi-tester QC panel
+  qcDeadline            DateTime?
+  qcToken               String?   @unique
+  qcClosedById          String?
+  qcFinalDecisionReason String?
+
+  productionOrderId String?
+  productionOrder   ProductionOrder? @relation(fields: [productionOrderId], references: [id])
+
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+  qcRecords             QcRecord[]
+  cuppingSessions       CuppingSession[]
+  cuppingSessionBatches CuppingSessionBatch[]
+  blendInputs           BlendIngredient[]     @relation("BlendTarget")
+  blendOutputs          BlendIngredient[]     @relation("BlendSource")
+  finishedGoodsLots     FinishedGoodsLot[]
+  packedLots            FinishedGoodsLot[]    @relation("PackedFromBatch")
+  /// Grams this roast contributed to packaged lots, including top-ups of packages that were
+  /// originally filled from a different roast.
+  packagingSources      PackagingSource[]     @relation("PackagingSourceBatch")
+  serialHistory         BatchSerialHistory[]
+  packagingOperations   PackagingOperation[]
+
+  @@unique([greenBeanId, batchNumber])
+  @@index([greenBeanId, createdAt])
+  @@index([status])
+  @@index([status, createdAt])
+}
+
+model BlendIngredient {
+  id                 String        @id @default(cuid())
+  sourceBatchId      String
+  sourceBatch        RoastingBatch @relation("BlendSource", fields: [sourceBatchId], references: [id], onDelete: Cascade)
+  targetBlendBatchId String
+  targetBlendBatch   RoastingBatch @relation("BlendTarget", fields: [targetBlendBatchId], references: [id], onDelete: Cascade)
+  quantityUsed       Float
+  createdAt          DateTime      @default(now())
+}
+
+model QcRecord {
+  id                String                @id @default(cuid())
+  batchId           String
+  batch             RoastingBatch         @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  date              DateTime              @default(now())
+  coffeeOrigin      String
+  processing        String
+  serialNumber      String
+  onProfile         Boolean               @default(false)
+  underDeveloped    Boolean               @default(false)
+  overDeveloped     Boolean               @default(false)
+  color             Int?
+  colorWhole        Float?
+  colorGround       Float?
+  remarks           String?
+  // Multi-tester panel fields
+  employeeId        String?
+  employee          Employee?             @relation(fields: [employeeId], references: [id])
+  isExternal        Boolean               @default(false)
+  testerName        String?
+  decision          String                @default("Accept") // "Accept" or "Reject"
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  correctionHistory QcCorrectionHistory[]
+
+  @@index([date])
+  @@index([batchId, date])
+}
+
+model Delivery {
+  id           String    @id @default(cuid())
+  orderItemId  String
+  orderItem    OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  date         DateTime  @default(now())
+  quantityKg   Float
+  deliveryType String // full, partial
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Units shipped, for deliveries against a SKU line. Null on legacy kg deliveries.
+  // quantityKg stays populated in both cases (derived from units for SKU lines) so
+  // dispatch history and the inventory ledger keep reading one field.
+  quantityUnits Int?
+
+  /// Client-supplied Idempotency-Key for the dispatch this row records. Nullable so the
+  /// previous application version, which sends none, keeps inserting deliveries while this
+  /// column already exists; unique so two concurrent retries of one dispatch collapse to a
+  /// single shipment.
+  requestKey    String? @unique
+  /// SHA-256 over a fixed-position array of the normalized dispatch intent. The same key
+  /// carrying a different intent is a client error, not a second shipment.
+  intentHash    String?
+
+  @@index([date])
+}
+
+model CuppingSession {
+  id             String                @id @default(cuid())
+  name           String
+  date           DateTime              @default(now())
+  status         String                @default("Open")
+  sessionToken   String?               @unique
+  batchId        String?
+  greenBeanId    String?
+  batch          RoastingBatch?        @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  greenBean      GreenBean?            @relation(fields: [greenBeanId], references: [id], onDelete: SetNull)
+  sessionBatches CuppingSessionBatch[]
+  scores         CuppingScore[]
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  @@index([status])
+}
+
+model CuppingSessionBatch {
+  id                   String         @id @default(cuid())
+  sessionId            String
+  session              CuppingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  batchId              String?
+  batch                RoastingBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  isExternalSample     Boolean        @default(false)
+  externalSampleName   String?
+  externalSupplierName String?
+  order                Int            @default(0)
+  scores               CuppingScore[]
+  createdAt            DateTime       @default(now())
+}
+
+model CuppingScore {
+  id                String               @id @default(cuid())
+  sessionId         String
+  session           CuppingSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionBatchId    String?
+  sessionBatch      CuppingSessionBatch? @relation(fields: [sessionBatchId], references: [id], onDelete: SetNull)
+  employeeId        String?
+  employee          Employee?            @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  externalName      String?
+  fragranceAroma    Float                @default(7)
+  flavor            Float                @default(7)
+  aftertaste        Float                @default(7)
+  acidity           Float                @default(7)
+  body              Float                @default(7)
+  balance           Float                @default(7)
+  uniformity        Float                @default(10)
+  cleanCup          Float                @default(10)
+  sweetness         Float                @default(10)
+  overall           Float                @default(7)
+  defectCups        Int                  @default(0)
+  defectType        String               @default("none")
+  finalScore        Float                @default(0)
+  notes             String?              @db.Text
+  flavorDescriptors String[]
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+}
+
+model SystemConfig {
+  id         String  @id @default("singleton")
+  logoBase64 String? @db.Text
+}
+
+model CustomerRoastPreference {
+  id                    String    @id @default(cuid())
+  customerId            String
+  customer              Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  greenBeanId           String
+  greenBean             GreenBean @relation(fields: [greenBeanId], references: [id], onDelete: Cascade)
+  profileName           String
+  usageType             String    @default("BOTH")
+  notes                 String?
+  // Agtron color targets
+  targetColorWhole      Float?
+  targetToleranceWhole  Float?
+  targetColorGround     Float?
+  targetToleranceGround Float?
+  targetDeltaMin        Float?
+  targetDeltaMax        Float?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@unique([customerId, greenBeanId])
+}
+
+model CoffeeProduct {
+  id                 String             @id @default(cuid())
+  productNameEn      String
+  productNameAr      String?
+  countryEn          String
+  countryAr          String?
+  regionEn           String?
+  regionAr           String?
+  varietyEn          String?
+  varietyAr          String?
+  processEn          String?
+  processAr          String?
+  altitude           String?
+  cupNotesEn         String?
+  cupNotesAr         String?
+  roastPathEn        String?
+  roastPathAr        String?
+  defaultGreenBeanId String?
+  defaultGreenBean   GreenBean?         @relation(fields: [defaultGreenBeanId], references: [id])
+  expectedRoastLoss  Float              @default(15.0)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  orderItems         OrderItem[]
+  roastingBatches    RoastingBatch[]
+  finishedGoodsLots  FinishedGoodsLot[]
+  productSkus        ProductSKU[]
+
+  // BOM lines that consume this coffee as roasted/intermediate stock.
+  bomComponents BomComponent[]
+}
+
+// ─── Procurement ─────────────────────────────────────────────────────────────
+
+enum PurchaseType {
+  GREEN_BEAN
+  PACKAGING
+  EQUIPMENT
+  OTHER
+}
+
+model Supplier {
+  id        String           @id @default(cuid())
+  name      String
+  contact   String?
+  createdAt DateTime         @default(now())
+  purchases PurchaseRecord[]
+}
+
+model PurchaseRecord {
+  id           String       @id @default(cuid())
+  supplierId   String
+  supplier     Supplier     @relation(fields: [supplierId], references: [id])
+  type         PurchaseType
+  itemId       String?
+  quantity     Float
+  costPerUnit  Float
+  totalCost    Float
+  purchaseDate DateTime
+  notes        String?
+  userId       String?
+  createdAt    DateTime     @default(now())
+
+  // Typed link for PACKAGING purchases. `itemId` above stays as-is for the existing
+  // untyped rows; this is the FK that lets a purchase actually restock a MaterialItem.
+  materialItemId String?
+  materialItem   MaterialItem? @relation(fields: [materialItemId], references: [id])
+
+  @@index([purchaseDate])
+  @@index([supplierId, purchaseDate])
+  @@index([materialItemId])
+}
+
+// ─── Inventory Ledger ─────────────────────────────────────────────────────────
+
+enum MovementType {
+  IN
+  OUT
+  ADJUSTMENT
+  LOSS
+}
+
+enum InventoryCategory {
+  RAW_MATERIAL
+  FINISHED_GOODS
+  ROASTED_COFFEE // intermediate stock between roasting and packaging
+  PACKAGING_MATERIAL // MaterialItem stock: bags, labels, cartons
+}
+
+enum SourceDocType {
+  PURCHASE
+  ROASTING_BATCH
+  DELIVERY
+  BLEND
+  MANUAL_ADJUSTMENT
+  PACKING
+  BOM_CONSUMPTION // packaging drawing roasted coffee + materials per a SKU's BOM
+  PRODUCTION_ORDER
+}
+
+model InventoryMovement {
+  id                String            @id @default(cuid())
+  type              MovementType
+  category          InventoryCategory
+  referenceEntityId String?
+  quantityChanged   Float
+  previousQuantity  Float
+  newQuantity       Float
+  sourceDocType     SourceDocType
+  sourceDocId       String?
+  userId            String?
+  timestamp         DateTime          @default(now())
+  notes             String?
+
+  @@index([timestamp])
+  @@index([category, timestamp])
+  @@index([referenceEntityId])
+}
+
+// ─── Finished Goods ───────────────────────────────────────────────────────────
+
+enum LotStatus {
+  AVAILABLE
+  RESERVED
+  SHIPPED
+
+  /// A physical package that exists but is not a complete sellable unit — a 1 KG bag
+  /// holding 250 g, for instance. It is real inventory: the coffee left the roast and the
+  /// bag was used, and both are accounted for. It simply is not a sellable SKU yet.
+  ///
+  /// The status is what keeps it out of allocation. Every path that can promise or ship
+  /// stock — availableUnitsBySku, reserveFinishedUnits, consumeFinishedUnits, the shelf
+  /// allocator, fulfillment-options — already requires status = AVAILABLE, so a PARTIAL lot
+  /// is invisible to all of them without a line of change in any of them. Topping the
+  /// package up to its nominal weight flips it to AVAILABLE, and that is the only way it
+  /// becomes sellable.
+  PARTIAL
+}
+
+model FinishedGoodsLot {
+  id              String         @id @default(cuid())
+  productId       String
+  product         CoffeeProduct  @relation(fields: [productId], references: [id])
+  productSkuId    String?
+  productSku      ProductSKU?    @relation(fields: [productSkuId], references: [id])
+  batchNumber     String
+  roastingBatchId String?        @unique
+  roastingBatch   RoastingBatch? @relation(fields: [roastingBatchId], references: [id])
+  quantityKg      Float
+  availableQty    Float
+
+  // ─── Shelf allocation ────────────────────────────────────────────────────
+  // Kilograms already promised to an order item but not yet shipped. Denormalised
+  // sum of the RESERVED StockAllocation rows pointing at this lot — kept on the lot
+  // itself so "is there enough free stock" is answerable by a single conditional
+  // UPDATE (availableQty - reservedQty >= n), the same atomic pattern the delivery
+  // deduction already uses. Free-to-promise is always availableQty - reservedQty.
+  reservedQty Float             @default(0)
+  allocations StockAllocation[]
+
+  status    LotStatus @default(AVAILABLE)
+  createdAt DateTime  @default(now())
+
+  // ─── Unit-native finished goods ──────────────────────────────────────────
+  // For a SKU-tracked lot, UNITS are the single source of truth: kg-equivalent is
+  // always derived as units x (ProductSKU.weightGrams / 1000), never stored twice.
+  //
+  // `isUnitTracked` is the discriminator, not a second opinion on the same balance.
+  // A lot is EITHER unit-tracked (new packaging output; units* authoritative,
+  // availableQty/reservedQty frozen at 0) OR legacy kg (rows produced before this
+  // change; availableQty/reservedQty authoritative, units* stay 0). The legacy rows
+  // cannot be converted honestly — 8.45 kg against a 1 KG SKU is not a whole number
+  // of bags — so they keep serving the legacy bean-based order lines in kg and are
+  // never rewritten.
+  isUnitTracked  Boolean @default(false)
+  unitsProduced  Int     @default(0)
+  unitsAvailable Int     @default(0)
+  unitsReserved  Int     @default(0)
+
+  // Which roast this lot was packed from. Distinct from `roastingBatchId` above, and not
+  // a duplicate of it: that column is 1:1 and UNIQUE — "this lot is that batch's entire
+  // packaged output", the legacy shape where a batch became exactly one kg lot. One roast
+  // can be packed into several SKUs (a 1 KG lot and a 250 g lot from the same batch), so
+  // the unit-tracked path needs a MANY:1 link and cannot reuse a unique column.
+  //
+  // Unit-tracked lots set this and leave `roastingBatchId` null; legacy lots are the
+  // reverse. Nothing sets both, so batch traceability is unambiguous either way.
+  packedFromBatchId String?
+  packedFromBatch   RoastingBatch? @relation("PackedFromBatch", fields: [packedFromBatchId], references: [id])
+
+  packagingOperations PackagingOperation[]
+
+  // ─── Actual fill, in whole grams ─────────────────────────────────────────
+  // Integers, not Float. Packaging arithmetic decides whether a package is sellable, and
+  // "is 0.1 + 0.2 === 0.3" is not a question inventory may depend on. Grams are the
+  // smallest unit anyone weighs here, so an Int holds the exact figure and comparisons
+  // against the nominal weight are exact. Float stays where it already is elsewhere in the
+  // packaging domain; nothing here re-denominates existing columns.
+  //
+  // Both are null on legacy rows and on ordinary standard lots, where the SKU's nominal
+  // weight times the unit count is the whole truth.
+
+  /// What is physically inside the package(s) of this lot. For a PARTIAL lot this is the
+  /// under-nominal fill; for a standard lot recorded through the unified workflow it is the
+  /// real weight that went in, which may legitimately exceed nominal (1005 g in a 1 KG bag).
+  actualContentGrams Int?
+
+  /// The SKU's nominal net weight at the moment of packing, copied so a later change to
+  /// master data cannot retroactively reclassify a package that was correct when it was made.
+  nominalContentGrams Int?
+
+  /// Whether the physical packaging materials for this lot have already been drawn. Set on
+  /// first pack and never cleared: topping a partial package up consumes more coffee but not
+  /// a second bag, and this flag is what makes that decision from data rather than from
+  /// inference about the operation's shape.
+  materialsConsumed Boolean @default(false)
+
+  /// Where the coffee in this lot came from, in grams per contributing roast. A top-up may
+  /// draw from a different batch than the original fill, so lineage cannot be a single
+  /// column — packedFromBatchId still names the first roast, and this carries the full story.
+  sources PackagingSource[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([productSkuId, status])
+  @@index([isUnitTracked, status])
+  @@index([packedFromBatchId])
+}
+
+/// One roast's contribution to one packaged lot.
+///
+/// Packaging used to be one roast in, one lot out, so a single column carried the lineage.
+/// A partial package that is finished later from a second roast breaks that: the bag holds
+/// coffee from two batches and both have to remain traceable, with the grams each supplied.
+/// Rows are append-only — a correction adds a reversing packaging operation, it does not
+/// rewrite where the coffee came from.
+model PackagingSource {
+  id String @id @default(cuid())
+
+  finishedGoodsLotId String
+  finishedGoodsLot   FinishedGoodsLot @relation(fields: [finishedGoodsLotId], references: [id], onDelete: Cascade)
+
+  roastingBatchId String
+  roastingBatch   RoastingBatch @relation("PackagingSourceBatch", fields: [roastingBatchId], references: [id], onDelete: Restrict)
+
+  /// Whole grams this roast contributed. Integer for the same reason as the lot columns.
+  gramsContributed Int
+
+  /// The packaging operation that recorded this contribution, for audit join-up.
+  packagingOperationId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([finishedGoodsLotId])
+  @@index([roastingBatchId])
+  @@index([packagingOperationId])
+}
+
+enum AllocationStatus {
+  RESERVED
+  CONSUMED
+  RELEASED
+}
+
+// One order item may be covered by several lots, so the promise is a row per
+// (order item, lot) pair rather than a column on either side. RESERVED rows are the
+// detail behind FinishedGoodsLot.reservedQty; CONSUMED rows record what a delivery
+// actually shipped; RELEASED rows are cancelled promises kept for audit.
+model StockAllocation {
+  id                 String           @id @default(cuid())
+  orderItemId        String
+  orderItem          OrderItem        @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  finishedGoodsLotId String
+  finishedGoodsLot   FinishedGoodsLot @relation(fields: [finishedGoodsLotId], references: [id])
+  quantityKg         Float
+  status             AllocationStatus @default(RESERVED)
+  createdById        String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  // Whole sellable units reserved, for allocations against a unit-tracked lot.
+  // Null on the legacy kg allocations (including the four written by the
+  // 20260826120000 backfill), where quantityKg remains authoritative. Exactly one of
+  // the two is meaningful per row, decided by the lot's isUnitTracked flag.
+  quantityUnits Int?
+
+  @@index([orderItemId, status])
+  @@index([finishedGoodsLotId, status])
+}
+
+// ─── Product Catalog & Production Planning ────────────────────────────────────
+
+enum PackagingMethod {
+  KG // the legacy kilogram bag path — PUT /api/roasting-batches/[id]/package
+  UNIT // the finished-SKU path      — POST /api/roasting-batches/[id]/pack-sku
+
+  /// The unified workflow — POST /api/roasting-batches/[id]/pack.
+  ///
+  /// Not a third way of packaging: it is the only one an operator now sees. The two values
+  /// above are retained because they label operations that were already recorded, and an
+  /// audit row must keep saying what actually happened. New operations are always PACK.
+  PACK
+}
+
+/**
+ * One packaging SUBMIT, recorded so that a retry can be recognised instead of re-executed.
+ *
+ * Packaging is not naturally idempotent and never can be. Packing a roast in several goes
+ * is ordinary operational reality, so "the same request twice" and "two genuine partial
+ * packs" are indistinguishable from the payload alone — the two are separated only by the
+ * key the client chose. That is why identity lives here, on the operation, and not as a
+ * single request key on RoastingBatch: one key per batch would make the second partial pack
+ * look like a replay of the first.
+ *
+ * Scoped to (batchId, requestKey) rather than requestKey alone. A key is meaningful only
+ * against the batch it was submitted for; a global unique would make two unrelated roasts
+ * collide if a client ever reused a key, and would turn a local mistake into a cross-batch
+ * failure.
+ *
+ * The row is written in the SAME transaction as the stock it describes, so a failed
+ * packaging leaves no operation behind and the same key may legitimately be retried.
+ */
+model PackagingOperation {
+  id String @id @default(cuid())
+
+  // RESTRICT, deliberately. This table is the audit record of stock that physically moved,
+  // so a cascade would erase the history at exactly the moment it matters most. The batch
+  // DELETE route carries a matching domain guard that answers 409 before the database is
+  // reached — the constraint is the backstop, not the user-facing behaviour.
+  batchId String
+  batch   RoastingBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  // Client-supplied idempotency key, or a server-generated one for callers that predate
+  // the contract. A server-generated key gives the operation an audit identity but cannot
+  // deduplicate a retry, because the retry would arrive without the original key.
+  requestKey String
+
+  // SHA-256 over the NORMALISED request intent, never over raw JSON text — property order
+  // must not change the hash. Same key + different hash is a client error, not a replay.
+  requestHash String
+
+  method PackagingMethod
+
+  // Kilograms for the KG path, whole units for the UNIT path. Float to match the rest of
+  // the packaging domain (StockAllocation.quantityKg, FinishedGoodsLot.availableQty);
+  // the Decimal columns in this schema belong to accounting.
+  quantityKg    Float?
+  quantityUnits Int?
+
+  productSkuId String?
+  productSku   ProductSKU? @relation(fields: [productSkuId], references: [id])
+
+  finishedGoodsLotId String?
+  finishedGoodsLot   FinishedGoodsLot? @relation(fields: [finishedGoodsLotId], references: [id])
+
+  // The response the first execution returned, replayed verbatim to a retry.
+  responseStatus Int
+  responseJson   Json
+
+  // Employee.id, denormalized — no FK relation (matches the InventoryMovement /
+  // OrderActivity / WorkItemClaim audit-table convention).
+  userId String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([batchId, requestKey])
+  @@index([batchId, createdAt])
+}
+
+enum ProductionOrderStatus {
+  PENDING
+  IN_PRODUCTION
+  COMPLETED
+  CANCELLED
+}
+
+enum ProductCategory {
+  ROASTED_COFFEE
+  GREEN_COFFEE
+  MERCHANDISE
+  OTHER
+}
+
+enum UnitOfMeasure {
+  UNIT // a discrete sellable pack (bag, box) — the default for finished SKUs
+  KG
+  GRAM
+  PIECE
+}
+
+enum MaterialCategory {
+  PACKAGING // bags, cartons
+  LABEL // stickers, printed labels
+  CONSUMABLE
+  OTHER
+}
+
+// Stocked non-coffee inventory: the bags, labels and cartons a BOM consumes.
+// Deliberately separate from GreenBean (coffee, kg-denominated) — these are counted
+// in discrete pieces and are never roasted. PurchaseRecord.materialItemId links a
+// PACKAGING purchase to the item it restocks, so buying bags can raise stock instead
+// of only recording cost.
+model MaterialItem {
+  id             String           @id @default(cuid())
+  code           String           @unique
+  name           String
+  nameAr         String?
+  category       MaterialCategory @default(PACKAGING)
+  unitOfMeasure  UnitOfMeasure    @default(PIECE)
+  quantityOnHand Float            @default(0)
+  reorderPoint   Float            @default(0)
+  isActive       Boolean          @default(true)
+  notes          String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  bomComponents BomComponent[]
+  purchases     PurchaseRecord[]
+
+  @@index([isActive])
+  @@index([category, isActive])
+}
+
+enum BomComponentType {
+  ROASTED_COFFEE // consumes kg from roasted/intermediate stock, identified by CoffeeProduct
+  MATERIAL // consumes pieces from MaterialItem
+}
+
+// One line of a finished SKU's bill of materials, expressed PER SELLABLE UNIT.
+//
+// A ROASTED_COFFEE line points at a CoffeeProduct and is measured in kilograms — it
+// draws on roasted/intermediate stock, never on GreenBean directly. Green coffee is
+// consumed only by roasting; the chain is
+//   GreenBean -> Roasting -> roasted stock -> Packaging (this BOM) -> FinishedGoodsLot.
+// A MATERIAL line points at a MaterialItem and is measured in pieces.
+//
+// Exactly one of coffeeProductId / materialItemId is set; a CHECK constraint in the
+// migration enforces that rather than leaving it to route code.
+model BomComponent {
+  id           String     @id @default(cuid())
+  productSkuId String
+  productSku   ProductSKU @relation(fields: [productSkuId], references: [id], onDelete: Cascade)
+
+  type BomComponentType
+
+  coffeeProductId String?
+  coffeeProduct   CoffeeProduct? @relation(fields: [coffeeProductId], references: [id])
+  materialItemId  String?
+  materialItem    MaterialItem?  @relation(fields: [materialItemId], references: [id])
+
+  quantityPerUnit Float // kg for ROASTED_COFFEE, pieces for MATERIAL
+  unitOfMeasure   UnitOfMeasure
+  notes           String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([productSkuId])
+  @@index([materialItemId])
+  @@index([coffeeProductId])
+}
+
+// A ProductSKU is the sellable Finished Product: exactly one SKU per row
+// ("Brazil Coffee – 1 KG" and "Brazil Coffee – 250g" are two rows). The coffee/origin
+// it is made from is `product` (CoffeeProduct); the pack size is `weightGrams`.
+// Sales orders reference ONLY this model — never a green bean, never a CoffeeProduct.
+model ProductSKU {
+  id                String             @id @default(cuid())
+  productId         String
+  product           CoffeeProduct      @relation(fields: [productId], references: [id])
+  skuCode           String             @unique
+  weightGrams       Float // net weight of one sellable unit; master data for BOM/production maths
+  isBulk            Boolean            @default(false)
+  price             Float              @default(0)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  orderItems        OrderItem[]
+  finishedGoodsLots FinishedGoodsLot[]
+  productionOrders  ProductionOrder[]
+  packagingOperations PackagingOperation[]
+
+  // ─── Finished Products catalog (additive) ────────────────────────────────
+  // Explicit display name. Nullable because the six pre-existing SKUs were created
+  // before this field; the API falls back to "<product name> – <pack size>" when unset.
+  name          String?
+  nameAr        String?
+  category      ProductCategory @default(ROASTED_COFFEE)
+  unitOfMeasure UnitOfMeasure   @default(UNIT)
+  isActive      Boolean         @default(true)
+
+  // Bill of materials — what one unit of this SKU consumes.
+  bomComponents BomComponent[]
+
+  @@index([isActive])
+  @@index([category, isActive])
+}
+
+model ProductionOrder {
+  id                  String                @id @default(cuid())
+  productionNumber    String                @unique
+  productSkuId        String
+  productSku          ProductSKU            @relation(fields: [productSkuId], references: [id])
+  targetUnits         Int
+  targetWeightKg      Float
+  expectedGreenBeanKg Float
+  status              ProductionOrderStatus @default(PENDING)
+  surplusHandled      Boolean               @default(false)
+  sourceOrderItemId   String?
+  sourceOrderItem     OrderItem?            @relation(fields: [sourceOrderItemId], references: [id])
+  greenBeanId         String?
+  greenBean           GreenBean?            @relation(fields: [greenBeanId], references: [id])
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+  roastingBatches     RoastingBatch[]
+}
+
+// ─── QC Correction History ────────────────────────────────────────────────────
+
+model QcCorrectionHistory {
+  id               String                    @id @default(cuid())
+  qcRecordId       String
+  qcRecord         QcRecord                  @relation(fields: [qcRecordId], references: [id], onDelete: Cascade)
+  batchId          String
+  correctionReason String
+  changedById      String
+  changedByName    String
+  changedAt        DateTime                  @default(now())
+  fieldChanges     QcCorrectionFieldChange[]
+
+  @@index([qcRecordId])
+  @@index([batchId])
+  @@index([changedAt])
+}
+
+model QcCorrectionFieldChange {
+  id           String              @id @default(cuid())
+  correctionId String
+  correction   QcCorrectionHistory @relation(fields: [correctionId], references: [id], onDelete: Cascade)
+  fieldName    String
+  oldValue     String?
+  newValue     String?
+
+  @@index([correctionId])
+}
+
+// ─── Batch Serial History ─────────────────────────────────────────────────────
+
+model BatchSerialHistory {
+  id             String        @id @default(cuid())
+  batchId        String
+  batch          RoastingBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  greenBeanId    String?
+  oldBatchNumber String
+  newBatchNumber String
+  reason         String
+  changedById    String
+  changedByName  String
+  changedAt      DateTime      @default(now())
+
+  @@index([batchId])
+  @@index([oldBatchNumber])
+}
+
+// ─── Order Operations S0 — Activity Timeline ──────────────────────────────────
+// Unified append-only timeline for both system-generated lifecycle events and
+// manual operational notes on an Order. Deliberately one table, not one history
+// table per event kind: every row shares the same shape and the UI renders them
+// as a single chronological feed — `type` already covers query-time filtering.
+//
+// onDelete: Cascade on the Order relation matches the existing domain-history
+// convention (QcCorrectionHistory -> QcRecord, BatchSerialHistory -> RoastingBatch,
+// both Cascade above): activity history has no independent existence once its
+// parent Order is gone. The existing Order.notes free-text field is untouched
+// and continues to serve whatever it already serves; OrderActivity is additive.
+//
+// Future tenancy: tenant-owned transitively through Order (see docs/saas-readiness.md).
+// No tenantId added now, per the standing SaaS-readiness constraint.
+model OrderActivity {
+  id      String @id @default(cuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  type    String // ORDER_CREATED | ORDER_APPROVED | ORDER_REJECTED | PREPARATION_REVIEWED |
+  // STATUS_CHANGED | MANUAL_NOTE | ORDER_HELD | ORDER_RESUMED | ORDER_CANCELLED | ORDER_COMPLETED
+  message String @db.Text
+
+  department String? // Sales, Online, Preparation, Production, Operations, Shipping — set only on MANUAL_NOTE
+  authorId   String? // Employee.id, denormalized — no FK relation (matches WorkItemClaim/QcCorrectionHistory convention)
+  authorName String
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+model LoginAttempt {
+  id             String   @id @default(cuid())
+  ipHash         String
+  identifierHash String
+  createdAt      DateTime @default(now())
+
+  @@index([ipHash, createdAt])
+  @@index([ipHash, identifierHash, createdAt])
+}
+
+model RateLimit {
+  id        String   @id @default(cuid())
+  scope     String
+  keyHash   String
+  createdAt DateTime @default(now())
+
+  @@index([scope, keyHash, createdAt])
+  @@index([createdAt])
+}
+
+// ─── Migration-history recovery ────────────────────────────────────────────
+// The models below are owned by sibling repos (ERP-login, ERP-workstations) and were
+// already applied directly to the shared demo database by those branches before this
+// branch's migration history existed. Imported byte-identical to their source schemas
+// (see ERP-login/prisma/schema.prisma and ERP-workstations/prisma/schema.prisma) purely
+// so this branch's schema.prisma matches the live demo DB and `prisma migrate dev` does
+// not propose dropping them. Not part of Accounting S0 — do not extend or modify here;
+// changes belong in the owning repo.
+
+model AuthAuditLog {
+  id               String   @id @default(cuid())
+  userId           String?
+  identifierHash   String?
+  action           String
+  result           String
+  reasonCode       String?
+  sourceInterface  String   @default("WEB")
+  workspaceRouting String?
+  ipHash           String
+  userAgent        String?
+  metadata         Json?
+  occurredAt       DateTime @default(now())
+
+  @@index([userId, occurredAt])
+  @@index([identifierHash, occurredAt])
+  @@index([action, occurredAt])
+  @@index([result, occurredAt])
+}
+
+model WorkItemClaim {
+  id             String    @id @default(cuid())
+  stationType    String // ROASTING | QUALITY | WAREHOUSE | PACKAGING | BAR
+  itemType       String // e.g. "RoastingBatch" | "QcRecord" — polymorphic, like InventoryMovement.referenceEntityId
+  itemId         String
+  itemRef        String // `${itemType}:${itemId}`
+  activeItemRef  String?   @unique // == itemRef while status="ACTIVE", null otherwise (enforces at most one active claim per item)
+  claimedById    String // Employee.id, denormalized — no FK relation (audit-table convention)
+  claimedByName  String
+  status         String    @default("ACTIVE") // ACTIVE | RELEASED | EXPIRED | OVERRIDDEN
+  claimedAt      DateTime  @default(now())
+  expiresAt      DateTime?
+  releasedAt     DateTime?
+  releasedById   String?
+  releasedByName String?
+
+  @@index([stationType, status])
+  @@index([itemType, itemId])
+  @@index([itemRef])
+  @@index([claimedById])
+  @@index([claimedAt])
+  @@index([status, expiresAt])
+}
+
+model WorkstationActionLog {
+  id              String   @id @default(cuid())
+  stationType     String
+  itemType        String
+  itemId          String
+  action          String // CLAIM | RELEASE | ADVANCE:<action> | FLAG
+  fromState       String?
+  toState         String?
+  employeeId      String // Employee.id, denormalized — no FK relation
+  employeeName    String
+  idempotencyKey  String   @unique
+  status          String // SUCCESS | REJECTED | ERROR
+  reason          String?
+  sourceInterface String   @default("STATION")
+  createdAt       DateTime @default(now())
+
+  @@index([stationType, createdAt])
+  @@index([itemType, itemId])
+  @@index([employeeId])
+  @@index([status])
+}
+
+// ─── Accounting S0 Foundation ──────────────────────────────────────────────
+// Single-tenant (no tenantId — no Tenant model exists; see docs/saas-readiness.md).
+// Money fields use Decimal (not Float) — debit=credit integrity cannot tolerate
+// floating-point rounding error. This is a deliberate deviation from the Float
+// convention used elsewhere in this schema, scoped only to these tables.
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum TaxCategoryType {
+  STANDARD
+  ZERO_RATED
+  EXEMPT
+  OUT_OF_SCOPE
+}
+
+enum FiscalPeriodStatus {
+  OPEN
+  LOCKED
+  CLOSED
+}
+
+enum JournalEntryType {
+  MANUAL
+  AUTO
+  REVERSAL
+  ADJUSTMENT
+  OPENING
+  CLOSING
+}
+
+enum JournalEntryStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  POSTED
+  REVERSED
+}
+
+enum AccountingEventStatus {
+  PENDING
+  TRANSLATED
+  FAILED
+}
+
+enum QoyodExportStatus {
+  NOT_EXPORTED
+  READY_FOR_EXPORT
+  EXPORTED
+  EXPORT_FAILED
+}
+
+model AccountingSettings {
+  // Singleton row, same pattern as SystemConfig — no Tenant model exists yet.
+  id String @id @default("singleton")
+
+  baseCurrency String @default("SAR")
+
+  // Phase 2+ placeholders — stored now per spec, not enforced by any service logic in S0.
+  costingMethod        String @default("WeightedAverage")
+  cogsPolicy           String @default("OnShipping")
+  branchAccountingMode String @default("CostCenterOnly")
+
+  exportToQoyod Boolean @default(false)
+
+  // Posting is blocked everywhere except setup routes while this is false. Must not
+  // default to true — there is no setup wizard in S0, so setup is never complete by default.
+  setupComplete Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  updatedBy String?
+}
+
+model Account {
+  id             String      @id @default(cuid())
+  code           String      @unique
+  nameAr         String?
+  nameEn         String
+  parentId       String?
+  parent         Account?    @relation("AccountHierarchy", fields: [parentId], references: [id])
+  children       Account[]   @relation("AccountHierarchy")
+  type           AccountType
+  allowPosting   Boolean     @default(true)
+  isActive       Boolean     @default(true)
+  qoyodAccountId String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  createdBy      String?
+  updatedBy      String?
+
+  journalEntryLines JournalEntryLine[]
+
+  @@index([type])
+  @@index([parentId])
+  @@index([isActive])
+}
+
+model TaxCategory {
+  id                   String          @id @default(cuid())
+  code                 String          @unique
+  nameAr               String?
+  nameEn               String
+  rate                 Decimal         @db.Decimal(5, 2)
+  categoryType         TaxCategoryType @default(STANDARD)
+  isDefault            Boolean         @default(false)
+  isActive             Boolean         @default(true)
+  requiresReason       Boolean         @default(false)
+  requiresApproval     Boolean         @default(false)
+  zatcaTaxCategoryCode String?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  createdBy            String?
+  updatedBy            String?
+
+  @@index([isActive])
+  @@index([categoryType])
+}
+
+model FiscalPeriod {
+  id        String             @id @default(cuid())
+  year      Int
+  periodNo  Int
+  startDate DateTime
+  endDate   DateTime
+  status    FiscalPeriodStatus @default(OPEN)
+  lockedAt  DateTime?
+  lockedBy  String?
+  closedAt  DateTime?
+  closedBy  String?
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  journalEntries JournalEntry[]
+
+  @@unique([year, periodNo])
+  @@index([status])
+  @@index([startDate, endDate])
+}
+
+model JournalEntry {
+  id               String             @id @default(cuid())
+  entryNo          Int                @unique @default(autoincrement())
+  entryDate        DateTime
+  fiscalPeriodId   String
+  fiscalPeriod     FiscalPeriod       @relation(fields: [fiscalPeriodId], references: [id])
+  type             JournalEntryType   @default(MANUAL)
+  status           JournalEntryStatus @default(DRAFT)
+  sourceModule     String             @default("manual")
+  sourceDocumentId String?
+  description      String?
+
+  // Reversal link lives on the REVERSAL entry, pointing at the ORIGINAL it reverses.
+  // @unique on reversesEntryId means Postgres allows many NULLs (non-reversal entries)
+  // but at most one row may point at a given original — i.e. an entry can only ever
+  // be reversed once. This is enforced at the DB level, not just in service code.
+  reversesEntryId String?       @unique
+  reversesEntry   JournalEntry? @relation("JournalEntryReversal", fields: [reversesEntryId], references: [id])
+  reversedByEntry JournalEntry? @relation("JournalEntryReversal")
+
+  totalDebit  Decimal @default(0) @db.Decimal(18, 2)
+  totalCredit Decimal @default(0) @db.Decimal(18, 2)
+  currency    String  @default("SAR")
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  createdBy   String?
+  submittedAt DateTime?
+  submittedBy String?
+  approvedAt  DateTime?
+  approvedBy  String?
+  postedAt    DateTime?
+  postedBy    String?
+
+  // Set only on the reversal entry itself (explanation for why the original was reversed).
+  reversalReason String?
+
+  lines              JournalEntryLine[]
+  accountingEvents   AccountingEvent[]
+  qoyodExportRecords QoyodExportRecord[]
+
+  @@index([status])
+  @@index([fiscalPeriodId])
+  @@index([entryDate])
+  @@index([sourceModule, sourceDocumentId])
+}
+
+model JournalEntryLine {
+  id             String       @id @default(cuid())
+  journalEntryId String
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  accountId      String
+  account        Account      @relation(fields: [accountId], references: [id])
+
+  // DB-level CHECK constraint (added by hand to the migration SQL, same precedent as the
+  // existing non-negative-quantity constraints) enforces: debit >= 0, credit >= 0, and
+  // exactly one of the two is > 0 while the other is exactly 0. See migration SQL comment.
+  debit  Decimal @default(0) @db.Decimal(18, 2)
+  credit Decimal @default(0) @db.Decimal(18, 2)
+
+  description         String?
+  taxCategorySnapshot Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([journalEntryId])
+  @@index([accountId])
+}
+
+model AccountingEvent {
+  id               String @id @default(cuid())
+  eventType        String
+  sourceModule     String
+  sourceDocumentId String
+  sourceEventId    String
+
+  // Dedicated idempotency key, built from sourceModule + sourceDocumentId + eventType +
+  // sourceEventId (the source's own event/version id). A single source document can emit
+  // many distinct events (e.g. multiple deliveries against one order) — keying only on
+  // (sourceModule, sourceDocumentId, eventType) would incorrectly block valid repeats.
+  idempotencyKey String @unique
+
+  occurredAt     DateTime              @default(now())
+  payload        Json
+  status         AccountingEventStatus @default(PENDING)
+  journalEntryId String?
+  journalEntry   JournalEntry?         @relation(fields: [journalEntryId], references: [id])
+  errorMessage   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sourceModule, sourceDocumentId])
+  @@index([status])
+  @@index([eventType])
+}
+
+model QoyodExportRecord {
+  id                String            @id @default(cuid())
+  journalEntryId    String
+  journalEntry      JournalEntry      @relation(fields: [journalEntryId], references: [id])
+  externalExportKey String            @unique
+  status            QoyodExportStatus @default(NOT_EXPORTED)
+  payloadSnapshot   Json?
+  responseSnapshot  Json?
+  qoyodReferenceId  String?
+  retryCount        Int               @default(0)
+  errorMessage      String?
+  exportedAt        DateTime?
+  exportedBy        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([journalEntryId])
+}

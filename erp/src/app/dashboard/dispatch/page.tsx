@@ -1,0 +1,671 @@
+"use client";
+
+import { useState, useEffect, useMemo, useRef } from "react";
+import { Truck, Search, AlertTriangle, Info, Layers } from "lucide-react";
+import WorkflowFilterBar, { type FilterOption } from "@/components/WorkflowFilterBar";
+import { formatDate } from "@/lib/utils";
+import { useUser } from "../user-context";
+import { hasSubPrivilege } from "@/lib/auth-shared";
+import { useI18n } from "@/lib/i18n/context";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type BatchSlim = {
+  status: string;
+  bags3kg: number; bags1kg: number; bags250g: number; bags150g: number; samplesGrams: number;
+};
+
+type OrderItem = {
+  id: string;
+  beanTypeName: string;
+  quantityKg: number;
+  productionStatus: string;
+  deliveryStatus: string;
+  deliveredQty: number;
+  remainingQty: number;
+  productId: string | null;
+  roastingBatches: BatchSlim[];
+  order: { orderNumber: number; customer: { name: string } };
+  // Non-null on a SKU line: it is sold, reserved and shipped in whole units.
+  quantityUnits: number | null;
+  deliveredUnits: number;
+  productSku: { id: string; skuCode: string; weightGrams: number } | null;
+};
+
+/**
+ * One dispatch, one key.
+ *
+ * The server refuses a delivery without an Idempotency-Key, and uses it to tell a retry
+ * of one dispatch apart from a second dispatch that happens to look identical. Only the
+ * client knows which of those the operator meant, so the key is minted here — once per
+ * opened dispatch form — and deliberately survives a failed attempt.
+ *
+ * randomUUID needs a secure context; a shop-floor tablet on plain http over the LAN would
+ * not have it. getRandomValues is available either way, so the fallback keeps the same 128
+ * bits of entropy rather than degrading to something guessable.
+ */
+function newIdempotencyKey(): string {
+  const c = globalThis.crypto;
+  if (typeof c?.randomUUID === "function") return c.randomUUID();
+  const bytes = new Uint8Array(16);
+  c.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** A SKU line ships units; a legacy line ships kilograms. */
+const isUnitLine = (i: OrderItem | null): boolean => !!i && i.quantityUnits !== null && !!i.productSku;
+
+type FGLot = {
+  id: string;
+  batchNumber: string;
+  quantityKg: number;
+  availableQty: number;
+  reservedQty: number;
+  /** Promised to the order item being delivered — shippable by it, invisible to others. */
+  reservedForThisItem?: number;
+  /** reservedForThisItem + free stock: what this item may take off the lot right now. */
+  deliverableQty?: number;
+  /** The same figure in whole units, present only on unit-tracked lots. */
+  deliverableUnits?: number;
+  unitsAvailable?: number;
+  productId: string;
+  product: { productNameEn: string; productNameAr: string | null };
+  status: string;
+  roastingBatch?: { orderItemId: string } | null;
+};
+
+type DeliveryRow = {
+  id: string;
+  date: string;
+  quantityKg: number;
+  deliveryType: string;
+  orderItem: { beanTypeName: string; order: { orderNumber: number; customer: { name: string } } };
+};
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+function packagedKg(batches: BatchSlim[]): number {
+  return +(batches
+    .filter((b) => b.status === "Packaged" || b.status === "Partially Packaged")
+    .reduce((sum, b) => sum + b.bags3kg * 3 + b.bags1kg * 1 + b.bags250g * 0.25 + b.bags150g * 0.15 + b.samplesGrams / 1000, 0)
+    .toFixed(3));
+}
+
+// ─── Page ────────────────────────────────────────────────────────────────────
+
+export default function DispatchPage() {
+  const { t, lang } = useI18n();
+  const user = useUser();
+  const canDeliver = hasSubPrivilege(user?.permissions ?? {}, "dispatch", "mark_delivered");
+
+  // ── Core data ─────────────────────────────────────────────────────────────
+  const [orders,     setOrders]     = useState<{ items: OrderItem[] }[]>([]);
+  const [deliveries, setDeliveries] = useState<DeliveryRow[]>([]);
+
+  // ── Filter state ──────────────────────────────────────────────────────────
+  const [search,      setSearch]      = useState("");
+  const [readySearch, setReadySearch] = useState("");
+  const [readyBean,   setReadyBean]   = useState("");
+  const [readyOrder,  setReadyOrder]  = useState("");
+
+  // ── Delivery modal state ──────────────────────────────────────────────────
+  const [showForm,      setShowForm]      = useState(false);
+  const [selectedItem,  setSelectedItem]  = useState<OrderItem | null>(null);
+  const [form,          setForm]          = useState({ quantityKg: 0, deliveryType: "full", notes: "" });
+  const [lotId,         setLotId]         = useState("");
+  const [lots,          setLots]          = useState<FGLot[]>([]);
+  const [lotsLoading,   setLotsLoading]   = useState(false);
+  const [submitError,   setSubmitError]   = useState("");
+  const [submitting,    setSubmitting]    = useState(false);
+  // Not state: changing it must never re-render, and a retry has to read the value the
+  // previous attempt used, not one a render cycle may not have committed yet.
+  const requestKeyRef = useRef<string | null>(null);
+
+  // ── Load ──────────────────────────────────────────────────────────────────
+  useEffect(() => { loadData(); }, []);
+
+  async function loadData() {
+    const [ordersRes, delRes] = await Promise.all([fetch("/api/orders"), fetch("/api/deliveries")]);
+    if (ordersRes.ok) setOrders(await ordersRes.json());
+    if (delRes.ok)    setDeliveries(await delRes.json());
+  }
+
+  // ── Open delivery modal ───────────────────────────────────────────────────
+  async function startDelivery(item: OrderItem) {
+    // A SKU line's outstanding amount is a unit count and comes straight off the line —
+    // not from summing packaged bags of its own batches, which is the legacy heuristic
+    // and says nothing about a line filled from shelf stock someone else roasted.
+    const outstandingUnits = isUnitLine(item)
+      ? Math.max(0, (item.quantityUnits ?? 0) - item.deliveredUnits)
+      : 0;
+    const available = isUnitLine(item)
+      ? outstandingUnits
+      : Math.max(0, +(packagedKg(item.roastingBatches) - item.deliveredQty).toFixed(3));
+
+    setSelectedItem(item);
+    setForm({
+      quantityKg:   available,
+      deliveryType: isUnitLine(item)
+        ? (available >= outstandingUnits ? "full" : "partial")
+        : (available >= item.quantityKg ? "full" : "partial"),
+      notes:        "",
+    });
+    setLotId("");
+    setSubmitError("");
+    // A new intended dispatch starts here.
+    requestKeyRef.current = newIdempotencyKey();
+    setShowForm(true);
+
+    // What this specific item can ship from. Filtering the global lot list by free
+    // quantity is wrong: a batch roasted for this very order is reserved to it in full
+    // the moment it is packaged, so its own lot has zero free quantity and would be
+    // filtered out — leaving the ordinary roast -> package -> deliver path with nothing
+    // to pick. The server returns each lot's deliverableQty for this item: its own
+    // reservation plus whatever is free to anyone.
+    setLotsLoading(true);
+    try {
+      const res = await fetch(`/api/order-items/${item.id}/fulfillment-options`);
+      if (res.ok) {
+        const data = await res.json();
+        type ApiLot = Omit<FGLot, "product"> & { product: FGLot["product"] | null };
+        setLots(
+          (data.matchingLots as ApiLot[])
+            .filter((l) => (l.deliverableQty ?? 0) > 0)
+            // Legacy/unnamed lots fall back to their batch number so the picker never
+            // renders a blank row.
+            .map((l) => ({ ...l, product: l.product ?? { productNameEn: l.batchNumber, productNameAr: null } }))
+        );
+      } else {
+        setLots([]);
+      }
+    } finally {
+      setLotsLoading(false);
+    }
+  }
+
+  function closeModal() {
+    requestKeyRef.current = null;
+    setShowForm(false);
+    setSelectedItem(null);
+    setLots([]);
+    setLotId("");
+    setSubmitError("");
+  }
+
+  // ── Submit delivery ───────────────────────────────────────────────────────
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    // A second submit while the first is still open would be a second POST under the same
+    // key: the server would answer it correctly, but the two responses would race to set
+    // this component’s state. Refuse it here instead.
+    if (submitting) return;
+
+    // Normally openModal minted this when the operator opened the form. It is null in exactly
+    // one case: the previous attempt was definitively refused (see below), which released it.
+    // Minting a fresh one then is correct — this is a new intent, not a retry of a dead one.
+    const requestKey = requestKeyRef.current ?? (requestKeyRef.current = newIdempotencyKey());
+
+    setSubmitError("");
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/deliveries", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": requestKey,
+        },
+        body: JSON.stringify({
+          orderItemId:        selectedItem!.id,
+          // The same input box carries units for a SKU line and kilograms for a legacy one;
+          // the server branches on the line, so send the field it will actually read.
+          ...(isUnitLine(selectedItem)
+            ? { quantityUnits: Math.trunc(form.quantityKg) }
+            : { quantityKg: form.quantityKg }),
+          deliveryType:       form.deliveryType,
+          notes:              form.notes || null,
+          finishedGoodsLotId: lotId || null,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        // ── What the key does after a failure ────────────────────────────────
+        // Only two outcomes exist on this route: it committed and answered 200/201, or it
+        // rolled back entirely. A 4xx is therefore a decision — no delivery, no stock
+        // drawn — and the intent it refused is dead, so the key is released and a
+        // corrected resubmission is judged on its own terms instead of colliding with a
+        // claim for the dispatch the operator has just changed.
+        //
+        // A 5xx is the opposite: the request may have committed and the answer been lost.
+        // Keeping the key is what makes the retry a replay of that dispatch rather than a
+        // second one, which is the entire reason this header exists.
+        if (res.status >= 500) {
+          setSubmitError(data.error || "Delivery could not be confirmed. Try again.");
+        } else {
+          requestKeyRef.current = null;
+          setSubmitError(data.error || "Delivery failed");
+        }
+        return;
+      }
+
+      // 200 (the server replayed an earlier identical dispatch) and 201 (it created one)
+      // both mean exactly one delivery exists and it is the one that was asked for.
+      closeModal();
+      loadData();
+    } catch {
+      // The request never produced an answer, so whether it reached the server is unknown.
+      // The key stays; the operator retries the same dispatch.
+      setSubmitError("Could not reach the server. Check the connection and try again.");
+    } finally {
+      // Reached on every path — including the throw above, which previously left the
+      // button disabled with no way back except a reload.
+      setSubmitting(false);
+    }
+  }
+
+  // ── Ready items list ──────────────────────────────────────────────────────
+  // An item is ready when there is coffee it can ship: either its own batches have been
+  // packaged, or preparation review covered it from the shelf. Gating on packaged batches
+  // alone — the rule the delivery route itself no longer uses — would hide exactly the
+  // orders this change exists to enable: the ones filled from stock with no roast at all.
+  const readyItems = orders.flatMap((o: any) =>
+    // Only orders the delivery route will actually accept. This mirrors
+    // DELIVERY_ALLOWED_STATUSES in lib/services/order-operations — that is the
+    // enforcement, this is only here so dispatch is not shown cancelled, held and
+    // unapproved orders it would be refused on. Keep the two in step.
+    (o.status === "Preparing" || o.status === "Ready for Shipping" ? o.items : [])
+      .filter((i: any) => {
+        if (i.deliveryStatus === "Delivered") return false;
+        // A SKU line is shippable when units remain on it. Its stock may have been
+        // reserved from shelf lots somebody else roasted, so the packaged-bags heuristic
+        // below — which only ever looks at this line's OWN batches — would hide it.
+        if (i.quantityUnits !== null && i.quantityUnits !== undefined) {
+          return (i.quantityUnits - (i.deliveredUnits ?? 0)) > 0;
+        }
+        return packagedKg(i.roastingBatches) > i.deliveredQty || (i.availableQuantity ?? 0) > 0;
+      })
+      .map((i: any) => ({ ...i, order: { orderNumber: o.orderNumber, customer: { name: o.customer?.name } } }))
+  );
+
+  const readyBeanOptions = useMemo<FilterOption[]>(() => {
+    const seen = new Set<string>();
+    const opts: FilterOption[] = [];
+    for (const item of readyItems) {
+      if (!seen.has(item.beanTypeName)) { seen.add(item.beanTypeName); opts.push({ label: item.beanTypeName, value: item.beanTypeName }); }
+    }
+    return opts;
+  }, [readyItems]);
+
+  const readyOrderOptions = useMemo<FilterOption[]>(() => {
+    const seen = new Set<string>();
+    const opts: FilterOption[] = [];
+    for (const item of readyItems) {
+      const v = String(item.order.orderNumber);
+      if (!seen.has(v)) { seen.add(v); opts.push({ label: `#${v} – ${item.order.customer.name}`, value: v }); }
+    }
+    return opts;
+  }, [readyItems]);
+
+  const filteredReadyItems = useMemo(() => {
+    const q = readySearch.toLowerCase();
+    return readyItems.filter((item: OrderItem) => {
+      if (readyBean && item.beanTypeName !== readyBean) return false;
+      if (readyOrder && String(item.order.orderNumber) !== readyOrder) return false;
+      if (q && !`${item.order.orderNumber} ${item.order.customer.name} ${item.beanTypeName}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [readyItems, readySearch, readyBean, readyOrder]);
+
+  // ── Lot selection derived state ───────────────────────────────────────────
+  const selectedLot   = lots.find((l) => l.id === lotId) ?? null;
+  const unitLine      = isUnitLine(selectedItem);
+  // What this item may take off the selected lot: its own reservation plus free stock.
+  // Compared in the line's own denomination — units for a SKU line, kilograms otherwise —
+  // so the ceiling matches what the input box actually holds.
+  const lotFreeQty    = selectedLot
+    ? Math.max(0, (unitLine ? selectedLot.deliverableUnits : selectedLot.deliverableQty) ?? 0)
+    : 0;
+  const lotExceedsQty = selectedLot !== null && form.quantityKg > lotFreeQty;
+  const canSubmit = !!lotId && !lotExceedsQty && !submitting;
+
+  // Split lots by priority:
+  // Tier 1/2: lots matching orderItem.productId (SKU-ready path, unchanged)
+  // Tier 3:   lots whose roastingBatch links back to this orderItem (bulk/custom path)
+  // Other:    remaining unrelated lots
+  const matchingLots = selectedItem
+    ? selectedItem.productId
+      ? lots.filter((l) => l.productId === selectedItem.productId)
+      : lots.filter((l) => l.roastingBatch?.orderItemId === selectedItem.id)
+    : [];
+  const otherLots = lots.filter((l) => !matchingLots.includes(l));
+
+  function lotLabel(lot: FGLot) {
+    const productLabel = lang === "ar" ? (lot.product.productNameAr ?? lot.product.productNameEn) : lot.product.productNameEn;
+    if (unitLine) {
+      const freeUnits = Math.max(0, lot.deliverableUnits ?? 0);
+      return `${lot.batchNumber} — ${productLabel} — ${t("availableLabel")}: ${freeUnits} ${t("unitsLabel")}`;
+    }
+    const free = Math.max(0, lot.deliverableQty ?? 0);
+    return `${lot.batchNumber} — ${productLabel} — ${t("lotAvailableKg")}: ${free.toFixed(1)} kg`;
+  }
+
+  return (
+    <div className="space-y-6">
+
+      {/* ── Page header ── */}
+      <div>
+        <h1 className="text-2xl font-extrabold text-charcoal">{t("dispatchTitle")}</h1>
+        <p className="text-brown text-sm font-medium">{readyItems.length} {t("itemsReadyDelivery")}</p>
+      </div>
+
+      {/* ── Ready for delivery ── */}
+      <div>
+        <h2 className="font-semibold text-charcoal mb-3">{t("readyForDelivery")}</h2>
+        {readyItems.length > 0 && (
+          <div className="mb-3">
+            <WorkflowFilterBar
+              searchQuery={readySearch} onSearchChange={setReadySearch}
+              beanOptions={readyBeanOptions} selectedBean={readyBean} onBeanChange={setReadyBean}
+              orderOptions={readyOrderOptions} selectedOrder={readyOrder} onOrderChange={setReadyOrder}
+              resultCount={filteredReadyItems.length} totalCount={readyItems.length}
+            />
+          </div>
+        )}
+        {filteredReadyItems.length === 0 ? (
+          <div className="text-center py-8 bg-white rounded-2xl border border-border text-muted-foreground">
+            <Truck size={32} className="mx-auto mb-2" /><p>{t("noItemsDelivery")}</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {filteredReadyItems.map((item) => {
+              const packed    = packagedKg(item.roastingBatches);
+              const available = Math.max(0, +(packed - item.deliveredQty).toFixed(3));
+              return (
+                <div key={item.id} data-testid={`dispatch-row-${item.order.orderNumber}`} className="bg-white rounded-2xl border border-border p-4 flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="font-semibold">#{item.order.orderNumber} — {item.order.customer.name}</p>
+                    <p className="text-sm text-brown font-medium">{item.beanTypeName} — {item.quantityKg}kg {t("kgOrdered")}</p>
+                    <p className="text-xs text-brown/70 mt-0.5">
+                      {t("packaged")}: {packed}kg · {t("availableForDelivery")}: {available}kg
+                    </p>
+                    {item.deliveredQty > 0 && (
+                      <div className="mt-1">
+                        <div className="w-48 bg-muted rounded-full h-1.5">
+                          <div className="bg-success h-1.5 rounded-full" style={{ width: `${Math.min(100, (item.deliveredQty / packed) * 100)}%` }} />
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-0.5">{item.deliveredQty}kg {t("deliveredKgLabel")}</p>
+                      </div>
+                    )}
+                  </div>
+                  {canDeliver && (
+                    <button
+                      onClick={() => startDelivery(item)}
+                      className="shrink-0 px-4 py-2 bg-orange text-white rounded-lg text-sm hover:bg-orange-dark flex items-center gap-2 shadow-md shadow-orange/20 hover:shadow-orange/35 active:scale-[0.98] transition-all duration-200 font-bold"
+                    >
+                      <Truck size={16} /> {t("deliver")}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ── Delivery history ── */}
+      <div>
+        <h2 className="font-semibold text-charcoal mb-3">{t("deliveryHistory")}</h2>
+        <div className="relative mb-3">
+          <Search size={18} className="absolute ltr:left-3 rtl:right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+          <input
+            type="text" placeholder={t("searchDeliveries")} value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-full ltr:pl-10 rtl:pr-10 pr-4 py-2.5 border-2 border-border rounded-xl bg-white focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors"
+          />
+        </div>
+        <div className="bg-white rounded-2xl border border-border overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-cream">
+              <tr>
+                <th className="text-start px-4 py-3 font-semibold">{t("date")}</th>
+                <th className="text-start px-4 py-3 font-semibold">{t("orderCol")}</th>
+                <th className="text-start px-4 py-3 font-semibold">{t("customer")}</th>
+                <th className="text-start px-4 py-3 font-semibold">{t("beanCol")}</th>
+                <th className="text-end px-4 py-3 font-semibold">{t("qtyKg")}</th>
+                <th className="text-center px-4 py-3 font-semibold">{t("type")}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {deliveries
+                .filter((d) =>
+                  `${d.orderItem.order.orderNumber} ${d.orderItem.order.customer.name} ${d.orderItem.beanTypeName}`
+                    .toLowerCase().includes(search.toLowerCase())
+                )
+                .map((d) => (
+                  <tr key={d.id} className="hover:bg-cream/50">
+                    <td className="px-4 py-3 text-brown">{formatDate(d.date)}</td>
+                    <td className="px-4 py-3">#{d.orderItem.order.orderNumber}</td>
+                    <td className="px-4 py-3">{d.orderItem.order.customer.name}</td>
+                    <td className="px-4 py-3">{d.orderItem.beanTypeName}</td>
+                    <td className="px-4 py-3 text-end font-medium">{d.quantityKg}</td>
+                    <td className="px-4 py-3 text-center">
+                      <span className={`status-badge ${d.deliveryType === "full" ? "status-completed" : "status-partial"}`}>
+                        {d.deliveryType === "full" ? t("fullBadge") : t("partialBadge")}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ════════════════════════════════════════════════════════════
+          DELIVERY MODAL
+          ════════════════════════════════════════════════════════════ */}
+      {canDeliver && showForm && selectedItem && (
+        <div
+          className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+          onClick={closeModal}
+        >
+          <div
+            className="bg-white rounded-2xl p-6 w-full max-w-md max-h-[92vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal header */}
+            <div className="flex items-start justify-between mb-1 gap-3">
+              <div>
+                <h2 className="text-lg font-extrabold text-charcoal">{t("recordDelivery")}</h2>
+                <p className="text-sm text-brown font-medium">
+                  #{selectedItem.order.orderNumber} — {selectedItem.beanTypeName}
+                </p>
+              </div>
+              <div className="w-10 h-10 rounded-xl bg-orange/10 flex items-center justify-center shrink-0">
+                <Truck size={18} className="text-orange" />
+              </div>
+            </div>
+
+            {/* Submit error */}
+            {submitError && (
+              <div className="mt-3 mb-1 flex items-start gap-2 px-3 py-2.5 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700 font-medium">
+                <AlertTriangle size={15} className="shrink-0 mt-0.5" />
+                <span>{submitError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit} className="space-y-4 mt-4">
+
+              {/* ── Lot selector ── */}
+              <div>
+                <label className="block text-sm font-bold text-charcoal mb-1.5">
+                  {t("selectBatchLot")} *
+                </label>
+
+                {lotsLoading ? (
+                  <div className="flex items-center gap-2 px-3 py-2.5 border-2 border-border rounded-xl text-sm text-brown/60">
+                    <div className="w-4 h-4 border-2 border-orange border-t-transparent rounded-full animate-spin" />
+                    {/* Also hard-coded Arabic: an English session saw it while the
+                        lot list loaded, which on a remote database is several seconds. */}
+                    <span>{t("loadingLots")}</span>
+                  </div>
+                ) : lots.length === 0 ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-start gap-2 px-3 py-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800">
+                      <AlertTriangle size={15} className="shrink-0 mt-0.5 text-amber-500" />
+                      <span>{t("noLotsAvailable")}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <select
+                    value={lotId}
+                    onChange={(e) => setLotId(e.target.value)}
+                    required
+                    className="w-full px-3 py-2.5 border-2 border-border rounded-xl focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors text-sm bg-white"
+                  >
+                    {/* Was hard-coded Arabic, so an English session saw one Arabic string
+                        in the middle of an otherwise English form. */}
+                    <option value="">{t("selectLot")}</option>
+
+                    {/* Matching product group */}
+                    {matchingLots.length > 0 && (
+                      <optgroup label={`✓ ${t("matchingProduct")}`}>
+                        {matchingLots.map((lot) => (
+                          <option key={lot.id} value={lot.id}>
+                            {lotLabel(lot)}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+
+                    {/* Other available lots */}
+                    {otherLots.length > 0 && (
+                      <optgroup label={t("otherAvailableLots")}>
+                        {otherLots.map((lot) => (
+                          <option key={lot.id} value={lot.id}>
+                            {lotLabel(lot)}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                  </select>
+                )}
+
+                {/* Selected lot detail card */}
+                {selectedLot && (
+                  <div className="mt-2 px-3 py-2.5 bg-cream rounded-xl border border-border">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="flex items-center gap-1.5 font-semibold text-charcoal">
+                        <Layers size={12} className="text-orange" />
+                        {selectedLot.batchNumber}
+                      </span>
+                      <span className={`font-bold tabular-nums ${
+                        lotFreeQty > 0 ? "text-green-600" : "text-red-500"
+                      }`}>
+                        {lotFreeQty.toFixed(1)} kg {t("lotAvailableKg")}
+                      </span>
+                    </div>
+                    <p className="text-xs text-brown/60 mt-0.5">
+                      {lang === "ar"
+                        ? (selectedLot.product.productNameAr ?? selectedLot.product.productNameEn)
+                        : selectedLot.product.productNameEn}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* ── Quantity ── */}
+              <div>
+                <label className="block text-sm font-bold text-charcoal mb-1.5">
+                  {unitLine ? `${t("quantityUnitsLabel")} *` : `${t("quantityKg")} *`}
+                </label>
+                <input
+                  type="number"
+                  step={unitLine ? 1 : 0.001}
+                  min={unitLine ? 1 : 0.001}
+                  value={form.quantityKg}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      quantityKg: unitLine
+                        ? (parseInt(e.target.value, 10) || 0)
+                        : (parseFloat(e.target.value) || 0),
+                    })
+                  }
+                  required
+                  className={`w-full px-3 py-2.5 border-2 rounded-xl focus:ring-2 focus:ring-orange/20 outline-none transition-colors text-sm ${
+                    lotExceedsQty ? "border-red-300 focus:border-red-400" : "border-border focus:border-orange"
+                  }`}
+                />
+                {/* Outstanding hint. A SKU line reads it straight off the line; the legacy
+                    path keeps its packaged-bags heuristic. */}
+                <p className="text-xs text-brown/60 mt-1">
+                  {unitLine
+                    ? `${t("maxLabel")} ${Math.max(0, (selectedItem.quantityUnits ?? 0) - selectedItem.deliveredUnits)} ${t("unitsLabel")}`
+                    : `${t("maxLabel")} ${Math.max(0, +(packagedKg(selectedItem.roastingBatches) - selectedItem.deliveredQty).toFixed(3))} kg (${t("packaged")})`}
+                </p>
+
+                {/* Lot quantity warning */}
+                {lotExceedsQty && (
+                  <div className="mt-1.5 flex items-center gap-1.5 text-xs font-bold text-red-600">
+                    <AlertTriangle size={13} />
+                    {t("lotExceedsWarn")} ({lotFreeQty.toFixed(1)} kg {t("lotAvailableKg")})
+                  </div>
+                )}
+
+                {/* FGL deduction note */}
+                {selectedLot && !lotExceedsQty && (
+                  <div className="mt-1.5 flex items-start gap-1.5 text-xs text-green-700 font-medium">
+                    <Info size={13} className="shrink-0 mt-0.5 text-green-500" />
+                    {t("fglDeductionNote")}
+                  </div>
+                )}
+              </div>
+
+              {/* ── Delivery type ── */}
+              <div>
+                <label className="block text-sm font-bold text-charcoal mb-1.5">{t("deliveryType")}</label>
+                <select
+                  value={form.deliveryType}
+                  onChange={(e) => setForm({ ...form, deliveryType: e.target.value })}
+                  className="w-full px-3 py-2.5 border-2 border-border rounded-xl focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors text-sm bg-white"
+                >
+                  <option value="full">{t("fullDelivery")}</option>
+                  <option value="partial">{t("partialDelivery")}</option>
+                </select>
+              </div>
+
+              {/* ── Notes ── */}
+              <div>
+                <label className="block text-sm font-bold text-charcoal mb-1.5">{t("notes")}</label>
+                <textarea
+                  value={form.notes}
+                  onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                  rows={2}
+                  className="w-full px-3 py-2 border-2 border-border rounded-xl focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors text-sm resize-none"
+                />
+              </div>
+
+              {/* ── Actions ── */}
+              <div className="flex gap-3 pt-1">
+                <button
+                  type="submit"
+                  disabled={!canSubmit}
+                  className="flex-1 py-2.5 bg-orange text-white rounded-xl font-bold text-sm hover:bg-orange/90 shadow-md shadow-orange/20 active:scale-[0.98] transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100"
+                >
+                  {submitting ? "…" : t("confirmDelivery")}
+                </button>
+                <button
+                  type="button"
+                  onClick={closeModal}
+                  className="flex-1 py-2.5 border-2 border-border rounded-xl font-bold text-sm text-brown hover:bg-gray-50 transition-colors"
+                >
+                  {t("cancel")}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

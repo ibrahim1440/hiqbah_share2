@@ -1,0 +1,801 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import { Plus, Search, ShoppingCart, ChevronDown, ChevronUp, Trash2, UserPlus, X, Pencil, Save, Clock, ClipboardList, MessageSquare } from "lucide-react";
+import { formatDate } from "@/lib/utils";
+import { useUser } from "../user-context";
+import { hasSubPrivilege } from "@/lib/auth-shared";
+import { useI18n } from "@/lib/i18n/context";
+import type { TranslationKey } from "@/lib/i18n/translations";
+import { orderNeedsAttention } from "@/lib/order-operations-client";
+import {
+  OrderStatusBadge, NeedsAttentionBadge, OwnerDisplay, ActivityTimeline, AddNoteForm,
+  StatusActionsBar, PreparationReviewTable, OrderProgressStepper, type LifecycleActivity,
+} from "@/components/OrderLifecyclePanel";
+
+const COMPLETION_STATUSES = new Set(["Passed", "Partially Packaged", "Packaged", "Blended"]);
+
+function itemCompletionTotal(item: OrderItem): number {
+  return item.roastingBatches
+    .filter((b) => COMPLETION_STATUSES.has(b.status) && !b.isBlend)
+    .reduce((s, b) => s + (b.roastedBeanQuantity > 0 ? b.roastedBeanQuantity : b.greenBeanQuantity), 0);
+}
+
+type CatalogProduct = {
+  id: string;
+  skuCode: string;
+  name: string;
+  packSize: string;
+  price: number;
+  isActive: boolean;
+  availableUnits: number;
+  hasBom: boolean;
+};
+
+type FulfilmentPreview = {
+  lines: {
+    productSkuId: string;
+    skuCode: string;
+    name: string;
+    orderedUnits: number;
+    availableUnits: number;
+    allocatedUnits: number;
+    productionRequiredUnits: number;
+    productionRequirement: { units: number; hasBom: boolean; blockedBy: string[] } | null;
+  }[];
+  totals: { orderedUnits: number; allocatedUnits: number; productionRequiredUnits: number };
+};
+
+type OrderItem = {
+  id: string; beanTypeName: string; quantityKg: number; productionStatus: string;
+  quantityUnits: number | null;
+  productId: string | null; productSkuId: string | null;
+  deliveryStatus: string; deliveredQty: number; remainingQty: number;
+  roastingBatches: { batchNumber: string; greenBeanQuantity: number; roastedBeanQuantity: number; status: string; isBlend: boolean }[];
+  deliveries: { date: string; quantityKg: number; deliveryType: string }[];
+  preparationDecision: string | null;
+  availableQuantity: number | null;
+  productionRequiredQuantity: number | null;
+};
+
+type Order = {
+  id: string; orderNumber: number; customer: { id: string; name: string };
+  quotationNumber: string | null; quotationSentDate: string | null;
+  approvalStatus: string; paymentStatus: string; vatInvoiceStatus: string;
+  notes: string | null; createdAt: string; items: OrderItem[];
+  status: string;
+  ownerId: string | null;
+  owner: { id: string; name: string; role: string } | null;
+  activities: LifecycleActivity[];
+};
+
+function lastActivityOf(order: Order): LifecycleActivity | null {
+  return order.activities.length > 0 ? order.activities[order.activities.length - 1] : null;
+}
+
+type Customer = { id: string; name: string };
+type GreenBean = { id: string; serialNumber: string; beanType: string; quantityKg: number };
+type ProductSku = { id: string; skuCode: string; weightGrams: number; isBulk: boolean; price: number };
+type ProductSummary = { id: string; productNameEn: string; productNameAr: string | null; productSkus: ProductSku[] };
+
+function StatusBadge({ status }: { status: string }) {
+  const { t } = useI18n();
+  const cls =
+    status === "Completed" || status === "Delivered" || status === "Paid" ? "status-completed" :
+    status === "Pending" || status === "Partial Paid" ? "status-pending" :
+    status === "In Production" ? "status-in-production" :
+    status === "Partial Delivered" ? "status-partial" :
+    status === "Not Paid" ? "status-not-paid" : "status-not-yet";
+  const labelMap: Record<string, TranslationKey> = {
+    "Completed":        "statusCompleted",
+    "Delivered":        "statusDelivered",
+    "Paid":             "statusPaid",
+    "Pending":          "pending",
+    "Partial Paid":     "statusPartialPaid",
+    "In Production":    "statusInProd",
+    "Partial Delivered":"statusPartDeliv",
+    "Not Paid":         "statusNotPaid",
+    "Not Yet":          "statusNotYet",
+  };
+  const label = labelMap[status] ? t(labelMap[status]) : status;
+  return <span className={`status-badge ${cls}`}>{label}</span>;
+}
+
+// ApprovalBadge removed with the routine approval UI: approval is no longer part of the
+// normal order path, so the row shows the lifecycle status instead. The approval API and
+// its historical data are untouched.
+
+export default function OrdersPage() {
+  const user = useUser();
+  const { t } = useI18n();
+  const canCreate = hasSubPrivilege(user?.permissions ?? {}, "orders", "create");
+  const canEditOrder = hasSubPrivilege(user?.permissions ?? {}, "orders", "edit");
+  const canDelete = hasSubPrivilege(user?.permissions ?? {}, "orders", "delete");
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [beans, setBeans] = useState<GreenBean[]>([]);
+  const [products, setProducts] = useState<ProductSummary[]>([]);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [showForm, setShowForm] = useState(false);
+  // In-flight guard for the create-order write, so the button cannot be pressed twice.
+  //
+  // Two flags on purpose. The state drives the disabled attribute; the ref is what
+  // actually stops a second submit, because setState does not apply within the same tick —
+  // two clicks dispatched before React re-renders both saw creating === false and both
+  // sent the order. A ref changes immediately, so the second call returns at the door.
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  // ── SKU-based order entry ────────────────────────────────────────────────
+  // A new order line is a finished product and a quantity of whole units. The coffee,
+  // origin, pack size, price and BOM all follow from the SKU, so none of them is asked
+  // for — that is the point of the redesign. Legacy bean-based lines on existing orders
+  // stay readable further down this page; they simply cannot be created any more.
+  const [catalog, setCatalog] = useState<CatalogProduct[]>([]);
+  const [preview, setPreview] = useState<FulfilmentPreview | null>(null);
+  const [form, setForm] = useState<{
+    customerId: string;
+    quotationNumber: string;
+    approvalStatus: string;
+    items: { productSkuId: string; quantityUnits: number }[];
+  }>({ customerId: "", quotationNumber: "", approvalStatus: "Pending", items: [{ productSkuId: "", quantityUnits: 0 }] });
+  const [showNewCustomer, setShowNewCustomer] = useState(false);
+  const [newCustomer, setNewCustomer] = useState({ name: "", nameAr: "", phone: "", email: "", address: "" });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<{
+    quotationNumber: string; approvalStatus: string; paymentStatus: string; vatInvoiceStatus: string; notes: string;
+    items: { id?: string; beanTypeName: string; quantityKg: number; greenBeanId: string; productId: string; productSkuId: string }[];
+  }>({ quotationNumber: "", approvalStatus: "", paymentStatus: "", vatInvoiceStatus: "", notes: "", items: [] });
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  async function loadData() {
+    const [ordersRes, custRes, beansRes, productsRes, catalogRes] = await Promise.all([
+      fetch("/api/orders"), fetch("/api/customers"), fetch("/api/green-beans"),
+      fetch("/api/coffee-products/summary"),
+      // The sellable catalog: one entry per finished SKU, with its free unit count.
+      // The raw finished-goods-lots fetch is gone — free stock is per SKU and in units
+      // now, and /api/products already reports it; summing lot kilograms here would have
+      // been a second, disagreeing implementation of availability.
+      fetch("/api/products"),
+    ]);
+    setOrders(await ordersRes.json());
+    setCustomers(await custRes.json());
+    setBeans(await beansRes.json());
+    setProducts(await productsRes.json());
+    if (catalogRes.ok) setCatalog(await catalogRes.json());
+  }
+
+  // Live fulfilment check for the lines currently typed into the create form.
+  //
+  // Asks the server rather than recomputing here: it draws the free pool down across
+  // lines and explodes the shortfall through each SKU's BOM, and duplicating that in the
+  // browser would be a second implementation to keep in step. Nothing is reserved — the
+  // binding reservation happens at preparation review and can come out lower if someone
+  // else buys the same stock in between.
+  useEffect(() => {
+    const lines = form.items
+      .filter((i) => i.productSkuId && i.quantityUnits > 0)
+      .map((i) => ({ productSkuId: i.productSkuId, quantityUnits: i.quantityUnits }));
+
+    // Ignore a response that arrives after the inputs have moved on. Every setPreview
+    // below runs inside the timer callback rather than in the effect body, so this never
+    // sets state synchronously during render.
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      if (lines.length === 0) {
+        setPreview(null);
+        return;
+      }
+      const res = await fetch("/api/orders/fulfillment-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines }),
+      });
+      if (cancelled) return;
+      setPreview(res.ok ? await res.json() : null);
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [form.items]);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    // Without this guard a double click sent the order twice and the customer got two of
+    // them. The button is disabled below for the same reason; this is the guard that holds
+    // when the click arrives before React has re-rendered.
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
+    try {
+      const res = await fetch("/api/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      if (!res.ok) {
+        const body = await res.json();
+        alert(body.error + (body.details ? "\n" + body.details.join("\n") : ""));
+        return;
+      }
+      setShowForm(false);
+      setForm({ customerId: "", quotationNumber: "", approvalStatus: "Pending", items: [{ productSkuId: "", quantityUnits: 0 }] });
+      setPreview(null);
+      loadData();
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
+    }
+  }
+
+  async function updateOrder(id: string, data: Record<string, string>) {
+    await fetch(`/api/orders/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    loadData();
+  }
+
+  async function deleteOrder(id: string) {
+    if (!confirm(t("confirmDeleteOrder"))) return;
+    await fetch(`/api/orders/${id}`, { method: "DELETE" });
+    setExpanded(null);
+    loadData();
+  }
+
+  function startEdit(order: Order) {
+    setEditingId(order.id);
+    setEditForm({
+      quotationNumber: order.quotationNumber || "",
+      approvalStatus: order.approvalStatus,
+      paymentStatus: order.paymentStatus,
+      vatInvoiceStatus: order.vatInvoiceStatus,
+      notes: order.notes || "",
+      items: order.items.map((i) => ({
+        id:          i.id,
+        beanTypeName: i.beanTypeName,
+        quantityKg:  i.quantityKg,
+        greenBeanId: beans.find((b) => b.beanType === i.beanTypeName)?.id || "",
+        productId:   i.productId   || "",
+        productSkuId: i.productSkuId || "",
+      })),
+    });
+  }
+
+  function updateEditItem(idx: number, field: string, value: string | number) {
+    const newItems = [...editForm.items];
+    (newItems[idx] as Record<string, string | number | undefined>)[field] = value;
+    setEditForm({ ...editForm, items: newItems });
+  }
+
+  function getEditStockWarnings() {
+    const demandMap = new Map<string, number>();
+    for (const item of editForm.items) {
+      if (!item.greenBeanId || !item.quantityKg) continue;
+      demandMap.set(item.greenBeanId, (demandMap.get(item.greenBeanId) || 0) + item.quantityKg);
+    }
+    return editForm.items.map((item) => {
+      if (!item.greenBeanId || !item.quantityKg) return null;
+      const bean = beans.find((b) => b.id === item.greenBeanId);
+      if (!bean) return null;
+      const totalDemand = demandMap.get(item.greenBeanId) || 0;
+      if (totalDemand > bean.quantityKg) {
+        return `${t("insufficientStock")} ${bean.quantityKg}kg, Total ordered: ${totalDemand}kg`;
+      }
+      return null;
+    });
+  }
+
+  async function handleEditSave() {
+    if (!editingId) return;
+    // approvalStatus/paymentStatus/vatInvoiceStatus are not editable through this
+    // generic route — they are owned by POST /api/orders/[id]/approve.
+    const { items, quotationNumber, notes } = editForm;
+    const res = await fetch(`/api/orders/${editingId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quotationNumber, notes, items }),
+    });
+    if (!res.ok) {
+      const body = await res.json();
+      alert(body.error + (body.details ? "\n" + body.details.join("\n") : ""));
+      return;
+    }
+    setEditingId(null);
+    loadData();
+  }
+
+  // submitApprovalDecision removed with the routine approval UI. POST
+  // /api/orders/[id]/approve still exists for exceptional policy work; it simply has no
+  // entry point on the normal operator path any more.
+
+  async function createCustomer() {
+    if (!newCustomer.name.trim()) return;
+    const res = await fetch("/api/customers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newCustomer),
+    });
+    const created = await res.json();
+    setCustomers((prev) => [created, ...prev]);
+    setForm({ ...form, customerId: created.id });
+    setNewCustomer({ name: "", nameAr: "", phone: "", email: "", address: "" });
+    setShowNewCustomer(false);
+  }
+
+  function addItem() {
+    setForm({ ...form, items: [...form.items, { productSkuId: "", quantityUnits: 0 }] });
+  }
+
+  function updateItem(idx: number, field: "productSkuId" | "quantityUnits", value: string | number) {
+    setForm({
+      ...form,
+      items: form.items.map((it, i) =>
+        i === idx
+          ? field === "quantityUnits"
+            ? { ...it, quantityUnits: Number(value) || 0 }
+            : { ...it, productSkuId: String(value) }
+          : it
+      ),
+    });
+  }
+
+  const filtered = orders.filter((o) => {
+    const matchSearch = `${o.orderNumber} ${o.customer.name} ${o.quotationNumber || ""}`.toLowerCase().includes(search.toLowerCase());
+    if (statusFilter === "all") return matchSearch;
+    return matchSearch && o.items.some((i) => i.productionStatus === statusFilter);
+  });
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-extrabold text-charcoal">{t("orders")}</h1>
+          <p className="text-brown text-sm font-medium">{orders.length} {t("totalOrdersCount")}</p>
+        </div>
+        {canCreate && (
+          <button onClick={() => setShowForm(true)} className="flex items-center gap-2 px-4 py-2 bg-orange text-white rounded-lg hover:bg-orange-dark shadow-md shadow-orange/20 hover:shadow-orange/35 active:scale-[0.98] transition-all duration-200 font-bold">
+            <Plus size={18} /> {t("newOrder")}
+          </button>
+        )}
+      </div>
+
+      <div className="flex gap-3 flex-wrap">
+        <div className="relative flex-1 min-w-[200px]">
+          <Search size={18} className="absolute ltr:left-3 rtl:right-3 top-1/2 -translate-y-1/2 text-gray-400" />
+          <input type="text" placeholder={t("searchOrders")} value={search} onChange={(e) => setSearch(e.target.value)}
+            className="w-full ltr:pl-10 rtl:pr-10 pr-4 py-2.5 border-2 border-border rounded-xl bg-white focus:ring-2 focus:ring-orange/30 focus:border-orange outline-none transition-colors" />
+        </div>
+        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
+          className="px-4 py-2.5 border-2 border-border rounded-xl bg-white focus:ring-2 focus:ring-orange/30 focus:border-orange outline-none transition-colors">
+          <option value="all">{t("allStatuses")}</option>
+          <option value="Pending">{t("pending")}</option>
+          <option value="In Production">{t("statusInProd")}</option>
+          <option value="Completed">{t("statusCompleted")}</option>
+        </select>
+      </div>
+
+      {showForm && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowForm(false)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-bold text-charcoal mb-4">{t("newOrder")}</h2>
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{t("customer")}</label>
+                <div className="flex gap-2">
+                  <select value={form.customerId} onChange={(e) => setForm({ ...form, customerId: e.target.value })}
+                    className="flex-1 px-3 py-2 border-2 border-border rounded-xl focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" required>
+                    <option value="">{t("selectCustomer")}</option>
+                    {customers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                  <button type="button" onClick={() => setShowNewCustomer(!showNewCustomer)}
+                    className={`p-2 rounded-lg border ${showNewCustomer ? "bg-red-50 border-red-200 text-red-600" : "bg-cream border-border text-brown"} hover:opacity-80`}
+                    title={showNewCustomer ? t("cancel") : t("addNewCustomer")}>
+                    {showNewCustomer ? <X size={18} /> : <UserPlus size={18} />}
+                  </button>
+                </div>
+                {showNewCustomer && (
+                  <div className="mt-2 p-3 bg-cream border border-border rounded-lg space-y-2">
+                    <p className="text-xs font-semibold text-brown">{t("newCustomerLabel")}</p>
+                    <input type="text" placeholder={t("nameEnglish") + " *"} value={newCustomer.name}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })}
+                      className="w-full px-3 py-1.5 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+                    <input type="text" placeholder={t("nameArabic")} dir="rtl" value={newCustomer.nameAr}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, nameAr: e.target.value })}
+                      className="w-full px-3 py-1.5 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+                    <input type="tel" placeholder={t("phone")} value={newCustomer.phone}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, phone: e.target.value })}
+                      className="w-full px-3 py-1.5 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+                    <input type="email" placeholder={t("emailLabel")} value={newCustomer.email}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, email: e.target.value })}
+                      className="w-full px-3 py-1.5 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+                    <input type="text" placeholder={t("address")} value={newCustomer.address}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, address: e.target.value })}
+                      className="w-full px-3 py-1.5 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+                    <button type="button" onClick={createCustomer} disabled={!newCustomer.name.trim()}
+                      className="w-full py-1.5 bg-orange text-white rounded-lg text-sm hover:bg-orange-dark disabled:opacity-50 shadow-md shadow-orange/20 hover:shadow-orange/35 active:scale-[0.98] transition-all duration-200 font-bold">
+                      {t("addCustomer")}
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">{t("quotationNumber")}</label>
+                <input type="text" value={form.quotationNumber} onChange={(e) => setForm({ ...form, quotationNumber: e.target.value })}
+                  className="w-full px-3 py-2 border-2 border-border rounded-xl focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+              </div>
+              {(() => {
+                // Section 8: one search box, then a quantity. No bean picker, no product
+                // picker, no SKU field — the SKU is the line.
+                const previewBySku = new Map((preview?.lines ?? []).map((l) => [l.productSkuId, l]));
+                const blocked = creating || form.items.some((i) => !i.productSkuId || i.quantityUnits <= 0);
+                return (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">{t("orderItemsLabel")}</label>
+                      {form.items.map((item, idx) => {
+                        const sku = catalog.find((c) => c.id === item.productSkuId);
+                        const row = item.productSkuId ? previewBySku.get(item.productSkuId) : undefined;
+                        return (
+                          <div key={idx} className="mb-2 border-2 border-border rounded-xl p-2.5">
+                            <div className="flex gap-2 items-start">
+                              <div className="flex-1">
+                                <input
+                                  list={`sku-list-${idx}`}
+                                  defaultValue=""
+                                  onChange={(e) => {
+                                    const v = e.target.value;
+                                    const chosen = catalog.find(
+                                      (c) => `${c.name} — ${c.skuCode}` === v || c.skuCode === v
+                                    );
+                                    updateItem(idx, "productSkuId", chosen ? chosen.id : "");
+                                  }}
+                                  placeholder={t("searchProductLabel")}
+                                  className="w-full px-3 py-2 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors"
+                                />
+                                <datalist id={`sku-list-${idx}`}>
+                                  {catalog
+                                    .filter((c) => c.isActive)
+                                    .map((c) => (
+                                      <option key={c.id} value={`${c.name} — ${c.skuCode}`}>
+                                        {`${t("availableLabel")}: ${c.availableUnits}`}
+                                      </option>
+                                    ))}
+                                </datalist>
+                              </div>
+                              <input
+                                type="number"
+                                min={1}
+                                step={1}
+                                placeholder={t("quantityUnitsLabel")}
+                                value={item.quantityUnits || ""}
+                                onChange={(e) => updateItem(idx, "quantityUnits", parseInt(e.target.value, 10) || 0)}
+                                className="w-24 px-3 py-2 border-2 border-border rounded-xl text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors"
+                                required
+                              />
+                              {form.items.length > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setForm({ ...form, items: form.items.filter((_, i) => i !== idx) })}
+                                  className="px-2 py-2 text-brown/60 hover:text-red-600"
+                                  aria-label="Remove line"
+                                >
+                                  <X size={16} />
+                                </button>
+                              )}
+                            </div>
+
+                            {sku ? (
+                              <p className="mt-1.5 text-xs text-brown/70 font-medium">
+                                {sku.skuCode} · {sku.packSize} · {sku.price.toFixed(2)} · {t("availableLabel")}:{" "}
+                                <span className="font-bold text-charcoal">{sku.availableUnits}</span>
+                                {!sku.hasBom && <span className="text-red-600 font-bold"> · {t("noBomWarning")}</span>}
+                              </p>
+                            ) : (
+                              <p className="mt-1.5 text-xs text-brown/50 font-medium">{t("noProductSelected")}</p>
+                            )}
+
+                            {/* Section 5: what the shelf covers, and what has to be produced. */}
+                            {row && row.orderedUnits > 0 && (
+                              <div className="mt-1.5 flex items-center gap-3 text-xs font-semibold flex-wrap">
+                                <span className="text-green-700">
+                                  {t("fromShelfLabel")}: {row.allocatedUnits}
+                                </span>
+                                {row.productionRequiredUnits > 0 && (
+                                  <span className="text-amber-700">
+                                    {t("toProduceUnitsLabel")}: {row.productionRequiredUnits}
+                                  </span>
+                                )}
+                                {row.productionRequirement && !row.productionRequirement.hasBom && (
+                                  <span className="text-red-600">{t("noBomWarning")}</span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      <button type="button" onClick={addItem} className="text-sm text-brown hover:underline">
+                        {t("addItem")}
+                      </button>
+                    </div>
+
+                    {preview && preview.totals.orderedUnits > 0 && (
+                      <div className="rounded-xl bg-cream border border-border px-3 py-2 text-xs font-semibold text-brown flex gap-4 flex-wrap">
+                        <span>{t("fulfilmentCheckTitle")}</span>
+                        <span className="text-green-700">
+                          {t("fromShelfLabel")}: {preview.totals.allocatedUnits}
+                        </span>
+                        <span className="text-amber-700">
+                          {t("toProduceUnitsLabel")}: {preview.totals.productionRequiredUnits}
+                        </span>
+                      </div>
+                    )}
+
+                    <div className="flex gap-3 pt-2">
+                      <button
+                        type="submit"
+                        disabled={blocked}
+                        className={`flex-1 py-2 rounded-lg font-bold shadow-md active:scale-[0.98] transition-all duration-200 ${blocked ? "bg-gray-300 text-gray-500 cursor-not-allowed shadow-none" : "bg-orange text-white hover:bg-orange-dark shadow-orange/20 hover:shadow-orange/35"}`}
+                      >
+                        {t("createOrder")}
+                      </button>
+                      <button type="button" onClick={() => setShowForm(false)} className="flex-1 py-2 border border-gray-300 rounded-lg hover:bg-gray-50">
+                        {t("cancel")}
+                      </button>
+                    </div>
+                  </>
+                );
+              })()}
+            </form>
+          </div>
+        </div>
+      )}
+
+      <div className="space-y-3">
+        {filtered.map((order) => (
+          <div key={order.id} data-testid={`order-card-${order.orderNumber}`} className="bg-white rounded-2xl border border-border shadow-sm overflow-hidden">
+            <div className="flex items-center justify-between p-4 cursor-pointer hover:bg-cream/50" onClick={() => setExpanded(expanded === order.id ? null : order.id)}>
+              <div className="flex items-center gap-4">
+                <div className="w-10 h-10 bg-cream rounded-lg flex items-center justify-center">
+                  <ShoppingCart size={18} className="text-brown" />
+                </div>
+                <div>
+                  <p className="font-semibold flex items-center gap-2 flex-wrap">
+                    #{order.orderNumber} — {order.customer.name}
+                    {orderNeedsAttention(order) && <NeedsAttentionBadge />}
+                  </p>
+                  <p className="text-xs text-brown">
+                    {order.quotationNumber || t("noQuotation")} | {formatDate(order.createdAt)} | {order.items.length} {t("itemsTotal")} | {order.items.reduce((s, i) => s + i.quantityKg, 0)} kg {t("total")}
+                  </p>
+                  <p className="text-xs text-brown/70 flex items-center gap-3 mt-1 flex-wrap">
+                    <OwnerDisplay owner={order.owner} />
+                    <span className="flex items-center gap-1">
+                      <Clock size={12} className="text-brown/50" />
+                      {t("lastActivityLabel")}: {lastActivityOf(order) ? formatDate(lastActivityOf(order)!.createdAt) : "—"}
+                    </span>
+                  </p>
+                </div>
+              </div>
+              {/* Approval is no longer part of the normal path, so its badge is gone from the
+                  row. The lifecycle badge below is the operator's status of record. */}
+              <div className="flex items-center gap-3">
+                <StatusBadge status={order.items.every((i) => i.productionStatus === "Completed") ? "Completed" : order.items.some((i) => i.productionStatus === "In Production") ? "In Production" : "Pending"} />
+                <OrderStatusBadge status={order.status} />
+                {expanded === order.id ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+              </div>
+            </div>
+
+            {expanded === order.id && (
+              <div className="border-t border-border p-3.5 bg-cream">
+                {/* Approve / Reject / Reset-to-Pending are deliberately absent. Routine
+                    approval is not part of the normal order path any more: an order goes
+                    from Created straight into Preparation, and the operator's next action
+                    is Commit Allocation on the preparation screen, not a decision here.
+                    The approval API and its historical data are untouched — only this
+                    routine entry point into it is gone. */}
+                <div className="flex justify-end gap-2 mb-3">
+                  {canEditOrder && editingId !== order.id && (
+                    <button onClick={() => startEdit(order)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-orange bg-orange-light border border-orange/20 rounded-lg hover:bg-orange/10">
+                      <Pencil size={14} /> {t("editOrder")}
+                    </button>
+                  )}
+                  {canDelete && (
+                    <button onClick={() => deleteOrder(order.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100">
+                      <Trash2 size={14} /> {t("deleteOrder")}
+                    </button>
+                  )}
+                </div>
+
+                {/* Progress Stepper — lifecycle milestones, not the activity log */}
+                <div className="bg-white rounded-xl border border-border px-4 py-3 mb-3">
+                  <OrderProgressStepper status={order.status} approvalStatus={order.approvalStatus} items={order.items} />
+                </div>
+
+                {/* Desktop: two-column (main content + right rail). Tablet and below: single column,
+                    timeline/status actions fall below preparation. */}
+                <div className="grid grid-cols-1 xl:grid-cols-3 gap-3 mb-4">
+                  <div className="xl:col-span-2 space-y-3">
+                    <div className="bg-white rounded-xl border border-border p-3.5 flex flex-wrap items-center gap-6">
+                      <div>
+                        <p className="text-[11px] font-bold text-brown/50 uppercase tracking-wide mb-1">{t("orderStatusLabel")}</p>
+                        <OrderStatusBadge status={order.status} />
+                      </div>
+                      <div>
+                        <p className="text-[11px] font-bold text-brown/50 uppercase tracking-wide mb-1">{t("orderOwnerLabel")}</p>
+                        <OwnerDisplay owner={order.owner} />
+                      </div>
+                    </div>
+
+                    <div className="bg-white rounded-xl border border-border p-3.5">
+                      <p className="text-xs font-bold text-brown mb-2 flex items-center gap-1.5">
+                        <ClipboardList size={14} /> {t("preparationReviewLabel")}
+                      </p>
+                      <PreparationReviewTable orderId={order.id} items={order.items} onSuccess={loadData} />
+                    </div>
+
+                    <div className="bg-white rounded-xl border border-border p-3.5">
+                      <p className="text-xs font-bold text-brown mb-2 flex items-center gap-1.5">
+                        <MessageSquare size={14} /> {t("addNoteLabel")}
+                      </p>
+                      <AddNoteForm orderId={order.id} onSuccess={loadData} />
+                    </div>
+                  </div>
+
+                  <div className="xl:col-span-1 space-y-3">
+                    <StatusActionsBar orderId={order.id} status={order.status} ownerId={order.ownerId} onSuccess={loadData} />
+
+                    <div className="bg-white rounded-xl border border-border p-3.5">
+                      <p className="text-xs font-bold text-brown mb-2 flex items-center gap-1.5">
+                        <Clock size={14} /> {t("activityTimelineLabel")}
+                      </p>
+                      <ActivityTimeline activities={order.activities} />
+                    </div>
+                  </div>
+                </div>
+
+                {editingId === order.id && (() => {
+                  const editWarnings = getEditStockWarnings();
+                  const hasEditStockError = editWarnings.some((w) => w !== null);
+                  return (
+                    <div className="bg-white rounded-xl border border-border p-4 mb-4 space-y-3">
+                      <div>
+                        <label className="block text-xs font-semibold text-brown mb-2">{t("orderItemsLabel")}</label>
+                        {editForm.items.map((item, idx) => (
+                          <div key={idx} className="mb-2">
+                            <div className="flex gap-2 items-center">
+                              <select value={item.greenBeanId} onChange={(e) => {
+                                const bean = beans.find((b) => b.id === e.target.value);
+                                updateEditItem(idx, "greenBeanId", e.target.value);
+                                if (bean) updateEditItem(idx, "beanTypeName", bean.beanType);
+                              }} className="flex-1 px-3 py-1.5 border-2 border-border rounded-lg text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors">
+                                <option value="">{t("selectBean")}</option>
+                                {beans.map((b) => <option key={b.id} value={b.id}>{b.beanType} ({b.quantityKg}kg)</option>)}
+                              </select>
+                              <input type="number" placeholder="kg" value={item.quantityKg || ""} onChange={(e) => updateEditItem(idx, "quantityKg", parseFloat(e.target.value) || 0)}
+                                className="w-24 px-3 py-1.5 border-2 border-border rounded-lg text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors" />
+                              {editForm.items.length > 1 && (
+                                <button type="button" onClick={() => setEditForm({ ...editForm, items: editForm.items.filter((_, i) => i !== idx) })}
+                                  className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"><Trash2 size={14} /></button>
+                              )}
+                            </div>
+                            <div className="flex gap-2 mt-1">
+                              <select value={item.productId} onChange={(e) => {
+                                updateEditItem(idx, "productId", e.target.value);
+                                updateEditItem(idx, "productSkuId", "");
+                              }} className="flex-1 px-3 py-1.5 border-2 border-border rounded-lg text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors">
+                                <option value="">No product</option>
+                                {products.map((p) => <option key={p.id} value={p.id}>{p.productNameEn}</option>)}
+                              </select>
+                              {item.productId && (
+                                <select value={item.productSkuId} onChange={(e) => updateEditItem(idx, "productSkuId", e.target.value)}
+                                  className="flex-1 px-3 py-1.5 border-2 border-border rounded-lg text-sm focus:border-orange focus:ring-2 focus:ring-orange/20 outline-none transition-colors">
+                                  <option value="">No SKU</option>
+                                  {(products.find((p) => p.id === item.productId)?.productSkus ?? []).map((s) => (
+                                    <option key={s.id} value={s.id}>{s.skuCode} ({s.weightGrams}g)</option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
+                            {editWarnings[idx] && (
+                              <p className="text-xs font-bold text-red-600 mt-1 px-1">{editWarnings[idx]}</p>
+                            )}
+                          </div>
+                        ))}
+                        <button type="button" onClick={() => setEditForm({ ...editForm, items: [...editForm.items, { beanTypeName: "", quantityKg: 0, greenBeanId: "", productId: "", productSkuId: "" }] })}
+                          className="text-sm text-brown hover:underline">{t("addItem")}</button>
+                      </div>
+                      <div className="flex gap-2 justify-end">
+                        <button onClick={() => setEditingId(null)}
+                          className="px-4 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">{t("cancel")}</button>
+                        <button onClick={handleEditSave} disabled={hasEditStockError}
+                          className={`flex items-center gap-1.5 px-4 py-1.5 text-sm rounded-lg font-bold shadow-md ${hasEditStockError ? "bg-gray-300 text-gray-500 cursor-not-allowed shadow-none" : "bg-orange text-white hover:bg-orange-dark shadow-orange/20"}`}>
+                          <Save size={14} /> {t("saveChanges")}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                <table className="w-full text-sm">
+                  <thead className="bg-white">
+                    <tr>
+                      <th className="text-start px-3 py-2 font-semibold">{t("beanType")}</th>
+                      <th className="text-end px-3 py-2 font-semibold">{t("qtyKg")}</th>
+                      <th className="text-center px-3 py-2 font-semibold">{t("production")}</th>
+                      <th className="text-center px-3 py-2 font-semibold">{t("deliveryCol")}</th>
+                      <th className="text-end px-3 py-2 font-semibold">{t("deliveredCol")}</th>
+                      <th className="text-end px-3 py-2 font-semibold">{t("remainingCol")}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {order.items.map((item) => {
+                      const completionTotal = itemCompletionTotal(item);
+                      const surplus = +(completionTotal - item.quantityKg).toFixed(2);
+                      const isOverproduced = surplus > 1;
+                      return (
+                        <tr key={item.id}>
+                          <td className="px-3 py-2">{item.beanTypeName}</td>
+                          <td className="px-3 py-2 text-end font-medium">{item.quantityKg}</td>
+                          <td className="px-3 py-2 text-center">
+                            <div className="flex flex-col items-center gap-1">
+                              <StatusBadge status={item.productionStatus} />
+                              {isOverproduced && (
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+                                  ⚠️ {t("overproduced")}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 text-center"><StatusBadge status={item.deliveryStatus} /></td>
+                          <td className="px-3 py-2 text-end">{item.deliveredQty}</td>
+                          <td className="px-3 py-2 text-end">
+                            {isOverproduced ? (
+                              <div className="flex flex-col items-end gap-0.5">
+                                <span className="font-bold text-amber-700">+{surplus}kg</span>
+                                <span className="text-[10px] text-amber-600 font-semibold">{t("surplusToInventory")}</span>
+                                <span className="text-[10px] text-brown/50">{t("totalProducedLabel")}: {completionTotal.toFixed(2)}kg — {t("requiredQtyLabel")}: {item.quantityKg}kg</span>
+                              </div>
+                            ) : (
+                              item.remainingQty
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {order.items.some((i) => i.roastingBatches.length > 0) && (
+                  <div className="mt-3 pt-3 border-t">
+                    <p className="text-xs font-semibold text-brown mb-2">{t("linkedBatches")}</p>
+                    <div className="flex flex-wrap gap-2">
+                      {order.items.flatMap((i) => i.roastingBatches).map((b) => (
+                        <span key={b.batchNumber} className="px-2 py-1 bg-orange-light text-brown rounded text-xs font-mono">
+                          {b.batchNumber} ({b.greenBeanQuantity}kg → {b.roastedBeanQuantity}kg)
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+        {filtered.length === 0 && (
+          <div className="text-center py-12 text-gray-400 bg-white rounded-2xl border">
+            <ShoppingCart size={40} className="mx-auto mb-2" />
+            <p>{t("noOrdersFound")}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

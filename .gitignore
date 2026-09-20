@@ -1,0 +1,119 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Secrets — never commit any of these
+# ═══════════════════════════════════════════════════════════════════════════
+.env
+.env.*
+*.env
+!.env.example
+!**/.env.example
+
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+*_rsa
+*_ed25519
+id_rsa*
+.ssh/
+
+# Database dumps and exports — may contain customer or employee data
+*.sql.gz
+*.dump
+*.bak
+*.backup
+dump.sql
+backup*.sql
+
+# Captured auth state
+auth-state.json
+storageState.json
+cookies.json
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Dependencies and build output
+# ═══════════════════════════════════════════════════════════════════════════
+node_modules/
+vendor/
+.pnp
+.pnp.js
+
+.next/
+out/
+dist/
+build/
+.turbo/
+.swc/
+
+# Prisma's generated client is produced by `prisma generate`
+**/src/generated/
+**/generated/prisma/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Test and coverage artefacts
+# ═══════════════════════════════════════════════════════════════════════════
+coverage/
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+.nyc_output/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Logs and runtime state
+# ═══════════════════════════════════════════════════════════════════════════
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+tmp/
+temp/
+.cache/
+
+# Laravel runtime (hqba/backend)
+storage/framework/cache/
+storage/framework/sessions/
+storage/framework/views/
+storage/logs/
+bootstrap/cache/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Deployment and provider state
+# ═══════════════════════════════════════════════════════════════════════════
+.vercel/
+.neon/
+.netlify/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Editor and OS
+# ═══════════════════════════════════════════════════════════════════════════
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Python
+# ═══════════════════════════════════════════════════════════════════════════
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Assistant-local configuration
+# ═══════════════════════════════════════════════════════════════════════════
+CLAUDE.md
+.claude/
